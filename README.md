@@ -2,167 +2,563 @@
 
 [![CI](https://github.com/ChristopherDavenport/jsonschema/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristopherDavenport/jsonschema/actions/workflows/ci.yml)
 
-A complete [JSON Schema](https://json-schema.org/) toolkit for Go: a spec-conformant
-**runtime validator** plus a **code generator** that emits idiomatic, self-validating Go
-types.
+If you consume or produce JSON that has a schema, `jsonschema` gives you two
+things the Go ecosystem has been missing at once: a validator that actually
+implements the **whole** spec — 100% of the official JSON Schema Test Suite for
+draft 2020-12, 2019-09, and draft-07, including `$ref`/`$dynamicRef`, `oneOf`,
+`if`/`then`/`else`, `unevaluated*`, `format`, and vocabularies — and a code
+generator that turns a schema into **idiomatic Go types** whose `UnmarshalJSON`
+and `Validate` enforce that schema for you. Point it at a schema and get structs,
+enums, discriminated-union interfaces, embedded compositions, and typed
+constraints, with no reflection, no hand-written validation, and no third-party
+runtime dependency in the code it emits. Reach for the validator when you work
+with dynamic data, the generator when you want compile-time types — or both, over
+the same schema, backed by the same engine so they never disagree.
 
-It parses draft **2020-12** (canonical), **2019-09**, and **draft-07**, normalizing all of
-them to a single internal model. Correctness is anchored to the official
-[JSON Schema Test Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite).
+## Contents
 
-## Why
+- [Install](#install)
+- [Runtime validation](#runtime-validation)
+- [Code generation, from simple to complex](#code-generation-from-simple-to-complex)
+- [The `x-go` extension](#the-x-go-extension)
+- [Conditional and combinator keywords](#conditional-and-combinator-keywords)
+- [Conformance](#conformance)
+- [Coverage vs. omissis/go-jsonschema](#coverage-vs-omissisgo-jsonschema)
+- [Package layout](#package-layout)
 
-The existing Go generators produce plain structs and quietly ignore most of the interesting
-spec — `oneOf`, `if`/`then`/`else`, `dependentRequired`, `patternProperties`, `uniqueItems`,
-tuples, `const`, and real `format` validation all silently no-op. The mature runtime
-validators, on the other hand, only validate generic decoded `any`, never your typed structs.
+## Install
 
-`jsonschema` closes that gap. One validation **engine** is the conformance-anchored source of
-truth; the code generator emits typed `Validate()` methods that mirror it keyword-for-keyword,
-so generated code cannot drift from the spec.
+```sh
+# the library (validator + generator API)
+go get github.com/ChristopherDavenport/jsonschema
 
-## Layout
+# the generator CLI
+go install github.com/ChristopherDavenport/jsonschema/cmd/jsonschema-gen@latest
+```
+
+## Runtime validation
+
+Compile a schema once, validate many decoded values. Instances are the shapes
+`encoding/json` produces (`nil`, `bool`, `float64`/`json.Number`, `string`,
+`[]any`, `map[string]any`); decode with `UseNumber` so numbers compare exactly.
+
+```go
+import (
+	"bytes"
+	"encoding/json"
+
+	"github.com/ChristopherDavenport/jsonschema"
+)
+
+sch, err := jsonschema.Compile(schemaBytes)
+if err != nil {
+	return err
+}
+
+dec := json.NewDecoder(bytes.NewReader(dataBytes))
+dec.UseNumber()
+var v any
+if err := dec.Decode(&v); err != nil {
+	return err
+}
+
+if err := sch.Validate(v); err != nil {
+	// err describes every failure, with JSON-Pointer instance locations.
+}
+```
+
+For multi-document schemas, remote references, or format assertion, use a
+`Compiler`:
+
+```go
+c := jsonschema.NewCompiler().AssertFormat(true)
+_ = c.AddResource("https://example.com/root.json", rootBytes)
+_ = c.AddResource("https://example.com/defs.json", defsBytes) // resolves a $ref
+sch, err := c.Compile("https://example.com/root.json")
+```
+
+`format` is annotation-only by default (per spec); `AssertFormat(true)` turns it
+into an assertion. `RegisterMetaSchemas()` bundles the official meta-schemas so a
+document can validate itself against its `$schema`.
+
+## Code generation, from simple to complex
+
+Each example below is the generated output of `jsonschema-gen` (lightly trimmed —
+repeated `UnmarshalJSON` boilerplate is elided where a prior example already
+shows it). Wire the generator into your build with `go:generate`:
+
+```go
+//go:generate jsonschema-gen -package user -root User -o user.gen.go user.schema.json
+```
+
+### 1. Objects and required fields
+
+The foundation: an object becomes a struct; optional fields become pointers with
+`omitempty`; required fields are enforced at decode time by a generated
+`UnmarshalJSON` (since `encoding/json` cannot otherwise tell absent from zero).
+
+```json
+{
+  "type": "object",
+  "required": ["id", "email"],
+  "properties": {
+    "id":     { "type": "integer" },
+    "email":  { "type": "string" },
+    "active": { "type": "boolean" }
+  }
+}
+```
+
+```go
+type User struct {
+	Active *bool  `json:"active,omitempty"`
+	Email  string `json:"email"`
+	ID     int64  `json:"id"`
+}
+
+func (x *User) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for _, k := range []string{"email", "id"} {
+		if _, ok := raw[k]; !ok {
+			return fmt.Errorf("missing required property %q", k)
+		}
+	}
+	type shadow struct {
+		Active *bool  `json:"active,omitempty"`
+		Email  string `json:"email"`
+		ID     int64  `json:"id"`
+	}
+	var sh shadow
+	if err := json.Unmarshal(data, &sh); err != nil {
+		return err
+	}
+	x.Active, x.Email, x.ID = sh.Active, sh.Email, sh.ID
+	return nil
+}
+
+func (x *User) Validate() error { return nil }
+```
+
+### 2. Constraints, formats, and enums
+
+Assertions become inline checks in `Validate`; an `enum` becomes a named type
+with typed constants and its own `Validate`. `-assert-format` emits `format`
+checks that call the dependency-free `xvalid` helpers.
+
+```json
+{
+  "type": "object",
+  "required": ["id", "name"],
+  "properties": {
+    "id":   { "type": "string", "format": "uuid" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "age":  { "type": "integer", "minimum": 0, "maximum": 130 },
+    "role": { "enum": ["admin", "user", "guest"] }
+  }
+}
+```
+
+```go
+type Account struct {
+	Age  *int64       `json:"age,omitempty"`
+	ID   string       `json:"id"`
+	Name string       `json:"name"`
+	Role *AccountRole `json:"role,omitempty"`
+}
+
+// (UnmarshalJSON enforces the required id and name, as in example 1.)
+
+func (x *Account) Validate() error {
+	if x.Age != nil {
+		if *x.Age < int64(0) {
+			return fmt.Errorf("age: below minimum")
+		}
+		if *x.Age > int64(130) {
+			return fmt.Errorf("age: above maximum")
+		}
+	}
+	if ok, _ := xvalid.CheckFormat("uuid", x.ID); !ok {
+		return fmt.Errorf("id: invalid uuid")
+	}
+	if utf8.RuneCountInString(x.Name) < 1 {
+		return fmt.Errorf("name: too short")
+	}
+	if utf8.RuneCountInString(x.Name) > 80 {
+		return fmt.Errorf("name: too long")
+	}
+	if x.Role != nil {
+		if err := x.Role.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type AccountRole string
+
+const (
+	AccountRoleAdmin AccountRole = "admin"
+	AccountRoleUser  AccountRole = "user"
+	AccountRoleGuest AccountRole = "guest"
+)
+
+func (x AccountRole) Validate() error {
+	switch x {
+	case AccountRoleAdmin, AccountRoleUser, AccountRoleGuest:
+		return nil
+	}
+	return fmt.Errorf("AccountRole: invalid value %v", x)
+}
+```
+
+### 3. Arrays, maps, and references
+
+`items` → a slice; `uniqueItems` → a dedup check; `additionalProperties` of a
+type → a `map[string]T` dictionary; a `$ref` → the named type it points at, whose
+`Validate` is called through the parent. A `pattern` compiles once into a
+package-level variable.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "tags":    { "type": "array", "items": {"type": "string"}, "uniqueItems": true },
+    "labels":  { "type": "object", "additionalProperties": {"type": "string"} },
+    "address": { "$ref": "#/$defs/address" }
+  },
+  "$defs": {
+    "address": {
+      "type": "object",
+      "required": ["street"],
+      "properties": {
+        "street": {"type": "string"},
+        "zip":    {"type": "string", "pattern": "^[0-9]{5}$"}
+      }
+    }
+  }
+}
+```
+
+```go
+type Resource struct {
+	Address *Address          `json:"address,omitempty"`
+	Labels  map[string]string `json:"labels,omitempty"`
+	Tags    []string          `json:"tags,omitempty"`
+}
+
+func (x *Resource) Validate() error {
+	if x.Address != nil {
+		if err := x.Address.Validate(); err != nil {
+			return err
+		}
+	}
+	{
+		arr := x.Tags
+		for i := 0; i < len(arr); i++ {
+			for j := i + 1; j < len(arr); j++ {
+				if reflect.DeepEqual(arr[i], arr[j]) {
+					return fmt.Errorf("tags: items are not unique")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Address is generated too, with its own required-enforcing UnmarshalJSON and:
+func (x *Address) Validate() error {
+	if x.Zip != nil {
+		if !pattern0.MatchString(*x.Zip) {
+			return fmt.Errorf("zip: does not match pattern")
+		}
+	}
+	return nil
+}
+
+var pattern0 = xvalid.MustCompilePattern("^[0-9]{5}$")
+```
+
+### 4. `oneOf` — discriminated unions as interfaces
+
+`oneOf`/`anyOf` become a **sealed marker interface** with a generated variant
+type per branch and an `Unmarshal<Name>` that selects the matching one (and
+enforces `oneOf`'s exactly-one rule). The parent decodes the field as raw JSON
+and routes it through that dispatcher — so `encoding/json`, which cannot populate
+an interface on its own, just works.
+
+```json
+{
+  "type": "object",
+  "required": ["payment"],
+  "properties": {
+    "payment": { "oneOf": [ {"$ref": "#/$defs/card"}, {"$ref": "#/$defs/bank"} ] }
+  },
+  "$defs": {
+    "card": {"type": "object", "required": ["cardNumber"], "properties": {"cardNumber": {"type": "string"}}},
+    "bank": {"type": "object", "required": ["iban"], "properties": {"iban": {"type": "string"}}}
+  }
+}
+```
+
+```go
+type Order struct {
+	Payment OrderPayment `json:"payment"`
+}
+
+type OrderPayment interface{ isOrderPayment() }
+
+type Card struct {
+	CardNumber string `json:"cardNumber"`
+}
+type Bank struct {
+	Iban string `json:"iban"`
+}
+
+func (_ Card) isOrderPayment() {}
+func (_ Bank) isOrderPayment() {}
+
+func UnmarshalOrderPayment(data []byte) (OrderPayment, error) {
+	var matches []OrderPayment
+	{
+		var v0 Card
+		if err := json.Unmarshal(data, &v0); err == nil {
+			if val, ok := any(&v0).(interface{ Validate() error }); !ok || val.Validate() == nil {
+				matches = append(matches, &v0)
+			}
+		}
+	}
+	{
+		var v1 Bank
+		if err := json.Unmarshal(data, &v1); err == nil {
+			if val, ok := any(&v1).(interface{ Validate() error }); !ok || val.Validate() == nil {
+				matches = append(matches, &v1)
+			}
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return nil, fmt.Errorf("OrderPayment: value matches no variant")
+	default:
+		return nil, fmt.Errorf("OrderPayment: value matches %d variants, want exactly one", len(matches))
+	}
+}
+
+func (x *Order) UnmarshalJSON(data []byte) error {
+	// ... required check ...
+	type shadow struct {
+		Payment json.RawMessage `json:"payment"`
+	}
+	var sh shadow
+	if err := json.Unmarshal(data, &sh); err != nil {
+		return err
+	}
+	if len(sh.Payment) > 0 {
+		v, err := UnmarshalOrderPayment(sh.Payment)
+		if err != nil {
+			return err
+		}
+		x.Payment = v
+	}
+	return nil
+}
+```
+
+Consuming it is a type switch:
+
+```go
+var o Order
+_ = json.Unmarshal(data, &o)
+switch p := o.Payment.(type) {
+case *Card:
+	useCard(p)
+case *Bank:
+	useBank(p)
+}
+```
+
+### 5. `allOf` — composition as struct embedding
+
+`allOf` of object schemas becomes Go struct embedding. Each part decodes from the
+full object (so it enforces its own `required`), and the composite `Validate`
+delegates to each part.
+
+```json
+{
+  "allOf": [ {"$ref": "#/$defs/base"}, {"$ref": "#/$defs/audit"} ],
+  "$defs": {
+    "base":  {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}},
+    "audit": {"type": "object", "required": ["createdBy"], "properties": {"createdBy": {"type": "string"}}}
+  }
+}
+```
+
+```go
+type Record struct {
+	Base
+	Audit
+}
+
+func (x *Record) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, &x.Base); err != nil { // enforces Base's required id
+		return err
+	}
+	if err := json.Unmarshal(data, &x.Audit); err != nil { // enforces Audit's required createdBy
+		return err
+	}
+	return nil
+}
+
+func (x *Record) Validate() error {
+	if err := x.Base.Validate(); err != nil {
+		return err
+	}
+	return x.Audit.Validate()
+}
+```
+
+`x.ID` and `x.CreatedBy` are promoted, so `Record` reads like one flat struct.
+
+### 6. `if`/`then`/`else` — conditional requirements
+
+When the `if` is a string-value discriminator and the branches add `required`,
+the condition becomes a plain Go conditional (matching the spec's rule that
+`properties` alone does not require presence).
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "kind":   {"type": "string"},
+    "secret": {"type": "string"}
+  },
+  "if":   {"properties": {"kind": {"const": "private"}}},
+  "then": {"required": ["secret"]}
+}
+```
+
+```go
+func (x *Item) Validate() error {
+	if x.Kind == nil || *x.Kind == "private" {
+		if x.Secret == nil {
+			return fmt.Errorf("\"secret\" is required here")
+		}
+	}
+	return nil
+}
+```
+
+## The `x-go` extension
+
+Steer generation per-schema, without leaving the document:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "createdAt": { "type": "string", "format": "date-time", "x-go": {"type": "time.Time", "import": "time"} }
+  }
+}
+```
+
+`x-go` fields: `type` (Go type used verbatim), `import` (its package path), `name`
+(override the generated identifier), `pointer` (force or forbid a pointer), and
+`extraTags` (extra `key:value` struct tags, e.g. for another library).
+
+## Conditional and combinator keywords
+
+`allOf` (example 5) and string-discriminator `if`/`then`/`else` (example 6) are
+generated as idiomatic Go. The remaining in-place keywords — general
+`if`/`then`/`else`, `dependentSchemas`, and `not` — would require emitting an
+arbitrary subschema as a boolean predicate, which amounts to re-implementing the
+validator as generated code. For those there are two modes:
+
+- **Default:** the type and a `Validate` are still generated, the keyword is not
+  enforced, and a `NOTE` comment says so. Output depends only on the standard
+  library and `xvalid`.
+- **`-engine-fallback`:** `Validate` for such a type delegates to the embedded
+  schema evaluated by the runtime engine — full conformance, at the cost of a
+  dependency on the `jsonschema` package and a marshal round-trip.
+
+The full rationale and tradeoff analysis is in
+[docs/conditionals.md](./docs/conditionals.md). Either way, the runtime engine is
+always available for complete coverage.
+
+The CLI takes these values as flags or from a YAML config (`-config gen.yaml`,
+with flags overriding it):
+
+```yaml
+package: person
+rootName: Person
+assertFormat: true
+input: person.schema.json
+output: person.gen.go
+```
+
+## Conformance
+
+The validator passes the official
+[JSON Schema Test Suite](https://github.com/json-schema-org/JSON-Schema-Test-Suite)
+required set at 100%, enforced as a CI gate:
+
+| Draft | Passing |
+|---|---|
+| 2020-12 | 1299 / 1299 (100%) |
+| 2019-09 | 1259 / 1259 (100%) |
+| draft-07 | 927 / 927 (100%) |
+
+This includes full `$dynamicRef`/`$recursiveRef` dynamic-scope resolution,
+offline meta-schema self-validation, and vocabulary-aware keyword gating. See
+[CONFORMANCE.md](./CONFORMANCE.md) for details and the one inherent limitation
+(RE2 lacks lookaround/backreferences, shared by every Go regex validator).
+
+## Coverage vs. omissis/go-jsonschema
+
+Legend: ✅ validated & generated · ⚙️ typed only · ❌ ignored/absent.
+
+| Feature | `jsonschema` (this) | omissis/go-jsonschema |
+|---|:--:|:--:|
+| `type`, `properties`, `required`, `enum` | ✅ | ✅ |
+| `const`, numeric, string constraints | ✅ | ✅ |
+| `uniqueItems`, `dependentRequired` | ✅ | ❌ |
+| `min`/`maxProperties`, `min`/`maxContains` | ✅ | ❌ |
+| `oneOf` (interface + variants) | ✅ | ❌ |
+| `allOf` (struct embedding) | ✅ | partial |
+| `anyOf` / `not` | ✅ | partial |
+| `if` / `then` / `else` | ✅ (discriminator inline; rest via fallback) | ❌ |
+| `dependentSchemas` | ✅ (validate; generate via fallback) | ❌ |
+| `patternProperties`, `propertyNames` | ✅ | ❌ |
+| `prefixItems` / tuples | ✅ | ❌ |
+| `unevaluatedProperties` / `unevaluatedItems` | ✅ | ❌ |
+| Boolean subschemas (`true`/`false`) | ✅ | partial |
+| `format` assertion (uuid/email/uri/…) | ✅ (opt-in) | ❌ |
+| nested `$ref`, remote refs, recursion | ✅ | partial |
+| `$dynamicRef` / `$recursiveRef` | ✅ | ❌ |
+| meta-schema self-validation (bundled) | ✅ | ❌ |
+
+## Package layout
 
 | Package | Purpose |
 |---|---|
 | `jsonschema` | Compile a schema and validate decoded `any` (the runtime validator + conformance target). |
 | `jsonschema/ir` | Internal schema model — a `Bool \| Object` sum type carrying every 2020-12 keyword. |
 | `jsonschema/dialect` | Detect `$schema` and normalize 2019-09 / draft-07 onto the canonical model. |
-| `jsonschema/loader` | Load JSON/YAML, resolve `$id`/`$ref`/`$anchor`/`$defs`, remote refs, cycles. |
+| `jsonschema/loader` | Load JSON, resolve `$id`/`$ref`/`$anchor`/`$defs`, remote refs, cycles. |
 | `jsonschema/gotype` | Map the model to a Go type model. |
-| `jsonschema/gen` | Emit Go source: types + `Validate()` + custom (un)marshalers. |
+| `jsonschema/gen` | Emit Go source: types + `Validate` + custom (un)marshalers. |
 | `jsonschema/xvalid` | Zero-dependency runtime helpers the generated code calls. |
+| `jsonschema/metaschema` | The bundled official meta-schemas. |
 | `cmd/jsonschema-gen` | The command-line generator. |
-
-## Coverage vs. omissis/go-jsonschema
-
-Legend: ✅ validated · ⚙️ typed only · ❌ ignored/absent.
-
-| Feature | `jsonschema` (this) | omissis/go-jsonschema |
-|---|:--:|:--:|
-| `type`, `properties`, `required`, `enum` | ✅ | ✅ |
-| `const` | ✅ | ✅ (string/num/bool) |
-| numeric (`minimum`…`multipleOf`) | ✅ | ✅ |
-| string (`minLength`/`maxLength`/`pattern`) | ✅ | ✅ |
-| `minItems`/`maxItems` | ✅ | ✅ |
-| `uniqueItems` | ✅ (validate + **generate**) | ❌ |
-| `minProperties`/`maxProperties` | ✅ | ❌ |
-| `dependentRequired` | ✅ (validate + **generate**) | ❌ |
-| `oneOf` (interface + variants) | ✅ (validate + **generate**) | ❌ |
-| `anyOf` / `not` | ✅ | partial |
-| `allOf` (validate + **generate** via embedding) | ✅ | partial |
-| `if` / `then` / `else` (discriminator generated inline; rest via fallback) | ✅ | ❌ |
-| `dependentSchemas` (validate; generate via fallback) | ✅ | ❌ |
-| `patternProperties` | ✅ | ❌ |
-| `propertyNames` | ✅ | ❌ |
-| `prefixItems` / tuples | ✅ (validate + **generate**) | ❌ |
-| `contains` / `min`/`maxContains` | ✅ | ❌ |
-| `unevaluatedProperties` / `unevaluatedItems` | ✅ | ❌ |
-| Boolean subschemas (`true`/`false`) | ✅ | partial |
-| `format` assertion (uuid/email/uri/…) | ✅ (opt-in) | ❌ |
-| nested `$ref`, remote refs, recursion | ✅ | partial |
-| `$dynamicRef` / `$recursiveRef` dynamic scope | ✅ | ❌ |
-| meta-schema self-validation (bundled) | ✅ | ❌ |
-
-## Usage
-
-Validate at runtime:
-
-```go
-s, _ := jsonschema.Compile(schemaBytes)
-err := s.Validate(decodedInstance) // decodedInstance is any from encoding/json
-```
-
-Generate self-validating Go types:
-
-```sh
-go run ./cmd/jsonschema-gen -package person -root Person -assert-format person.schema.json > person.go
-```
-
-Configuration can also come from a YAML file (flags override its values):
-
-```yaml
-# gen.yaml
-package: person
-rootName: Person
-assertFormat: true
-input: person.schema.json
-output: person.go
-```
-
-```sh
-go run ./cmd/jsonschema-gen -config gen.yaml
-```
-
-The generated code depends only on the standard library and this module's
-`xvalid` helper package. Each struct gets an `UnmarshalJSON` that enforces
-required properties and a `Validate() error` whose inline checks mirror the
-validation engine.
-
-## Status
-
-The runtime validator passes the JSON Schema Test Suite required set at **100%**
-for 2020-12, 2019-09, and draft-07 — including full `$dynamicRef` resolution,
-offline meta-schema self-validation, and vocabulary-aware keyword gating (see
-[CONFORMANCE.md](./CONFORMANCE.md)).
-
-The code generator handles objects, enums, `$ref`, scalars, arrays, `format`,
-required-field enforcement via `UnmarshalJSON`, nested validation, numeric
-bounds/`multipleOf`, `uniqueItems`, `dependentRequired`, `additionalProperties`
-dictionaries (`map[string]T`), `prefixItems` tuples (array-shaped
-`(Un)MarshalJSON`), the `x-go` type-override extension, and **`oneOf`/`anyOf` as
-sealed marker interfaces** with generated variant dispatch (`Unmarshal<Name>`).
-### Conditional and combinator keywords
-
-The generated `Validate` mirrors the engine inline for type, presence,
-scalar/array assertions, `format`, `uniqueItems`, `dependentRequired`,
-`oneOf`/`anyOf`, and nested validation. Two combinator/conditional cases are also
-emitted as idiomatic Go:
-
-- **`allOf`** of object schemas → struct embedding (`type X struct { A; B }`),
-  with each part enforcing its own `required` and `Validate`.
-- **A string-discriminator `if`** (`{"if":{"properties":{"kind":{"const":"x"}}},
-  "then":{"required":[…]}}`) → a plain `if x.Kind == … { … }`.
-
-The remaining cases — general `if`/`then`/`else`, `dependentSchemas`, and `not` —
-would require re-implementing the validator as generated boolean predicates,
-which stops looking like idiomatic Go. For those there are two modes:
-
-- **Default:** the type and a `Validate` method are still generated, but these
-  keywords are not enforced; a `NOTE` comment is emitted above the method. The
-  generated package depends only on the standard library and `xvalid`.
-- **`-engine-fallback`:** for any type that uses one of these keywords, `Validate`
-  delegates to the embedded schema evaluated by the runtime engine — full
-  conformance, at the cost of a dependency on the `jsonschema` package and a
-  marshal round-trip. The generated *types* stay idiomatic; only their `Validate`
-  changes. This is opt-in per generation.
-
-Either way, you can always validate with the runtime engine directly:
-
-```go
-s, _ := jsonschema.Compile(schemaBytes)
-err := s.Validate(decodedInstance)
-```
-
-See [docs/conditionals.md](./docs/conditionals.md) for the full design rationale
-and the tradeoff analysis.
-
-### The `x-go` extension
-
-Steer generation per-schema without leaving the document:
-
-```json
-{
-  "type": "string",
-  "format": "date-time",
-  "x-go": { "type": "time.Time", "import": "time" }
-}
-```
-
-`x-go` fields: `type` (Go type to use verbatim), `import` (its package path),
-`name` (override the generated identifier), `pointer` (force/forbid a pointer),
-and `extraTags` (additional `key:value` struct tags).
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE). Bundled third-party content is attributed in
+[NOTICE](./NOTICE).
