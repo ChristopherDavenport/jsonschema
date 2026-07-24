@@ -78,11 +78,11 @@ type rawSchema struct {
 	PropertyNames         *Schema            `json:"propertyNames"`
 	UnevaluatedProperties *Schema            `json:"unevaluatedProperties"`
 
-	PrefixItems      []*Schema        `json:"prefixItems"`
-	Items            json.RawMessage  `json:"items"`
-	AdditionalItems  *Schema          `json:"additionalItems"`
-	Contains         *Schema          `json:"contains"`
-	UnevaluatedItems *Schema          `json:"unevaluatedItems"`
+	PrefixItems      []*Schema       `json:"prefixItems"`
+	Items            json.RawMessage `json:"items"`
+	AdditionalItems  *Schema         `json:"additionalItems"`
+	Contains         *Schema         `json:"contains"`
+	UnevaluatedItems *Schema         `json:"unevaluatedItems"`
 
 	Type *TypeSet `json:"type"`
 

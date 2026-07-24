@@ -1,5 +1,7 @@
 # jsonschema
 
+[![CI](https://github.com/ChristopherDavenport/jsonschema/actions/workflows/ci.yml/badge.svg)](https://github.com/ChristopherDavenport/jsonschema/actions/workflows/ci.yml)
+
 A complete [JSON Schema](https://json-schema.org/) toolkit for Go: a spec-conformant
 **runtime validator** plus a **code generator** that emits idiomatic, self-validating Go
 types.

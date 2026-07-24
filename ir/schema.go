@@ -22,16 +22,16 @@ type Schema struct {
 	Boolean *bool
 
 	// Core keywords and identifiers.
-	ID            string             // $id
-	SchemaURI     string             // $schema
-	Vocabulary    map[string]bool    // $vocabulary
-	Anchor        string             // $anchor
-	DynamicAnchor string             // $dynamicAnchor
-	Ref           string             // $ref
-	DynamicRef    string             // $dynamicRef (or $recursiveRef, normalized)
-	RecursiveAnchor bool             // $recursiveAnchor: true (2019-09)
-	Defs          map[string]*Schema // $defs
-	Comment       string             // $comment
+	ID              string             // $id
+	SchemaURI       string             // $schema
+	Vocabulary      map[string]bool    // $vocabulary
+	Anchor          string             // $anchor
+	DynamicAnchor   string             // $dynamicAnchor
+	Ref             string             // $ref
+	DynamicRef      string             // $dynamicRef (or $recursiveRef, normalized)
+	RecursiveAnchor bool               // $recursiveAnchor: true (2019-09)
+	Defs            map[string]*Schema // $defs
+	Comment         string             // $comment
 
 	// Metadata annotations.
 	Title       string
@@ -127,11 +127,11 @@ type Schema struct {
 
 // XGo is the `x-go` vendor extension: per-schema overrides for code generation.
 type XGo struct {
-	Type       string   // fully-qualified Go type to use verbatim, e.g. "time.Time"
-	Import     string   // import path required by Type, e.g. "time"
-	Name       string   // override the generated type/field identifier
-	Pointer    *bool    // force (or forbid) a pointer wrapper
-	ExtraTags  []string // additional struct tags, e.g. `validate:"required"`
+	Type      string   // fully-qualified Go type to use verbatim, e.g. "time.Time"
+	Import    string   // import path required by Type, e.g. "time"
+	Name      string   // override the generated type/field identifier
+	Pointer   *bool    // force (or forbid) a pointer wrapper
+	ExtraTags []string // additional struct tags, e.g. `validate:"required"`
 }
 
 // IsBoolean reports whether s is a boolean schema (`true`/`false`).

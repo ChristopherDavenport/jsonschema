@@ -17,11 +17,11 @@ const suiteRoot = "third_party/JSON-Schema-Test-Suite"
 // testGroup mirrors one element of a suite file: a schema plus its cases.
 type testGroup struct {
 	Description string          `json:"description"`
-	Schema     json.RawMessage `json:"schema"`
-	Tests      []struct {
+	Schema      json.RawMessage `json:"schema"`
+	Tests       []struct {
 		Description string          `json:"description"`
-		Data       json.RawMessage `json:"data"`
-		Valid      bool            `json:"valid"`
+		Data        json.RawMessage `json:"data"`
+		Valid       bool            `json:"valid"`
 	} `json:"tests"`
 }
 

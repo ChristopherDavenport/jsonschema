@@ -24,10 +24,10 @@ import (
 // fileConfig mirrors the CLI flags for the -config file. Pointer fields let us
 // tell "absent" from "set to the zero value".
 type fileConfig struct {
-	Package      *string `yaml:"package"`
-	RootName     *string `yaml:"rootName"`
-	BaseURI      *string `yaml:"baseURI"`
-	AssertFormat *bool   `yaml:"assertFormat"`
+	Package        *string `yaml:"package"`
+	RootName       *string `yaml:"rootName"`
+	BaseURI        *string `yaml:"baseURI"`
+	AssertFormat   *bool   `yaml:"assertFormat"`
 	Input          *string `yaml:"input"`
 	Output         *string `yaml:"output"`
 	EngineFallback *bool   `yaml:"engineFallback"`
