@@ -31,7 +31,26 @@ const enginePkg = "github.com/ChristopherDavenport/jsonschema"
 // hybrid reports whether a declaration's Validate should delegate to the
 // runtime engine rather than mirror the schema inline.
 func (e *emitter) hybrid(d *gotype.Decl) bool {
-	return e.cfg.EngineFallback && d.Schema != nil && hasUnenforced(d.Schema)
+	return e.cfg.EngineFallback && e.needsFallback(d)
+}
+
+// needsFallback reports whether a declaration uses keywords that are neither
+// mirrored inline nor handled idiomatically (allOf embedding, discriminator if).
+func (e *emitter) needsFallback(d *gotype.Decl) bool {
+	s := d.Schema
+	if s == nil {
+		return false
+	}
+	if s.Not != nil || len(s.DependentSchemas) > 0 {
+		return true
+	}
+	if (s.If != nil || s.Then != nil || s.Else != nil) && !e.ifHandled(d) {
+		return true
+	}
+	if len(s.AllOf) > 0 && !d.AllOfHandled {
+		return true
+	}
+	return false
 }
 
 type patternVar struct {
@@ -85,7 +104,10 @@ func (e *emitter) emitStruct(f *jen.File, d *gotype.Decl) {
 	if d.Doc != "" {
 		f.Comment(d.Name + " " + d.Doc)
 	}
-	fields := make([]jen.Code, 0, len(d.Fields))
+	fields := make([]jen.Code, 0, len(d.Fields)+len(d.Embeds))
+	for _, emb := range d.Embeds {
+		fields = append(fields, jen.Id(emb.Named)) // embedded (anonymous) field
+	}
 	for _, fld := range d.Fields {
 		var code *jen.Statement
 		if d.Tuple {
@@ -162,7 +184,7 @@ func (e *emitter) emitUnmarshal(f *jen.File, d *gotype.Decl) {
 			ifaceFields = append(ifaceFields, fld)
 		}
 	}
-	if len(required) == 0 && len(ifaceFields) == 0 {
+	if len(required) == 0 && len(ifaceFields) == 0 && len(d.Embeds) == 0 {
 		return
 	}
 
@@ -173,6 +195,14 @@ func (e *emitter) emitUnmarshal(f *jen.File, d *gotype.Decl) {
 			jen.Return(jen.Err()),
 		),
 	)
+	// allOf: decode each embedded part from the full object (each enforces its
+	// own required fields and fills its own promoted fields).
+	for _, emb := range d.Embeds {
+		body = append(body, jen.If(
+			jen.Err().Op(":=").Qual("encoding/json", "Unmarshal").Call(jen.Id("data"), jen.Op("&").Id("x").Dot(emb.Named)),
+			jen.Err().Op("!=").Nil(),
+		).Block(jen.Return(jen.Err())))
+	}
 	if len(required) > 0 {
 		lits := make([]jen.Code, len(required))
 		for i, r := range required {
@@ -185,43 +215,45 @@ func (e *emitter) emitUnmarshal(f *jen.File, d *gotype.Decl) {
 		))
 	}
 
-	// Shadow struct: interface fields become raw JSON, everything else keeps its
-	// real type so encoding/json fills it in directly.
-	shadowFields := make([]jen.Code, 0, len(d.Fields))
-	for _, fld := range d.Fields {
-		tag := fld.JSONName
-		if !fld.Required {
-			tag += ",omitempty"
+	// Shadow struct: decode this type's own (non-embedded) fields. Interface
+	// fields become raw JSON; everything else keeps its real type.
+	if len(d.Fields) > 0 {
+		shadowFields := make([]jen.Code, 0, len(d.Fields))
+		for _, fld := range d.Fields {
+			tag := fld.JSONName
+			if !fld.Required {
+				tag += ",omitempty"
+			}
+			var ft *jen.Statement
+			if name := coreName(fld.Type); name != "" && e.isInterface[name] {
+				ft = jen.Qual("encoding/json", "RawMessage")
+			} else {
+				ft = e.fieldType(fld)
+			}
+			shadowFields = append(shadowFields, jen.Id(fld.Name).Add(ft).Tag(map[string]string{"json": tag}))
 		}
-		var ft *jen.Statement
-		if name := coreName(fld.Type); name != "" && e.isInterface[name] {
-			ft = jen.Qual("encoding/json", "RawMessage")
-		} else {
-			ft = e.fieldType(fld)
-		}
-		shadowFields = append(shadowFields, jen.Id(fld.Name).Add(ft).Tag(map[string]string{"json": tag}))
-	}
-	body = append(body,
-		jen.Type().Id("shadow").Struct(shadowFields...),
-		jen.Var().Id("sh").Id("shadow"),
-		jen.If(jen.Err().Op(":=").Qual("encoding/json", "Unmarshal").Call(jen.Id("data"), jen.Op("&").Id("sh")), jen.Err().Op("!=").Nil()).Block(
-			jen.Return(jen.Err()),
-		),
-	)
+		body = append(body,
+			jen.Type().Id("shadow").Struct(shadowFields...),
+			jen.Var().Id("sh").Id("shadow"),
+			jen.If(jen.Err().Op(":=").Qual("encoding/json", "Unmarshal").Call(jen.Id("data"), jen.Op("&").Id("sh")), jen.Err().Op("!=").Nil()).Block(
+				jen.Return(jen.Err()),
+			),
+		)
 
-	ifaceSet := map[string]bool{}
-	for _, fld := range ifaceFields {
-		ifaceSet[fld.Name] = true
-	}
-	for _, fld := range d.Fields {
-		if ifaceSet[fld.Name] {
-			body = append(body, jen.If(jen.Len(jen.Id("sh").Dot(fld.Name)).Op(">").Lit(0)).Block(
-				jen.List(jen.Id("v"), jen.Err()).Op(":=").Id("Unmarshal"+coreName(fld.Type)).Call(jen.Id("sh").Dot(fld.Name)),
-				jen.If(jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())),
-				jen.Id("x").Dot(fld.Name).Op("=").Id("v"),
-			))
-		} else {
-			body = append(body, jen.Id("x").Dot(fld.Name).Op("=").Id("sh").Dot(fld.Name))
+		ifaceSet := map[string]bool{}
+		for _, fld := range ifaceFields {
+			ifaceSet[fld.Name] = true
+		}
+		for _, fld := range d.Fields {
+			if ifaceSet[fld.Name] {
+				body = append(body, jen.If(jen.Len(jen.Id("sh").Dot(fld.Name)).Op(">").Lit(0)).Block(
+					jen.List(jen.Id("v"), jen.Err()).Op(":=").Id("Unmarshal"+coreName(fld.Type)).Call(jen.Id("sh").Dot(fld.Name)),
+					jen.If(jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())),
+					jen.Id("x").Dot(fld.Name).Op("=").Id("v"),
+				))
+			} else {
+				body = append(body, jen.Id("x").Dot(fld.Name).Op("=").Id("sh").Dot(fld.Name))
+			}
 		}
 	}
 	body = append(body, jen.Return(jen.Nil()))
@@ -272,6 +304,12 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 		return
 	}
 	var body []jen.Code
+	// allOf: validate each embedded part.
+	for _, emb := range d.Embeds {
+		if e.hasValidate[emb.Named] {
+			body = append(body, jen.If(jen.Err().Op(":=").Id("x").Dot(emb.Named).Dot("Validate").Call(), jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())))
+		}
+	}
 	for _, fld := range d.Fields {
 		checks := e.fieldChecks(fld)
 		if len(checks) == 0 {
@@ -284,22 +322,178 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 		}
 	}
 	body = append(body, e.dependentRequiredChecks(d)...)
+	if e.ifHandled(d) {
+		body = append(body, e.emitIfThenElse(d)...)
+	}
 	body = append(body, jen.Return(jen.Nil()))
 
-	// Warn when the schema uses keywords the generator does not yet enforce.
-	if hasUnenforced(d.Schema) {
-		f.Comment("NOTE: this schema uses if/then/else, dependentSchemas, not, or")
-		f.Comment("allOf, which are not yet enforced by generated Validate. For full")
-		f.Comment("coverage, validate with the jsonschema runtime engine.")
+	// Warn when the schema uses keywords the generator does not enforce (and
+	// the engine fallback was not requested).
+	if e.needsFallback(d) {
+		f.Comment("NOTE: this schema uses not, dependentSchemas, or a non-discriminator")
+		f.Comment("if/then/else that generated Validate does not enforce. Regenerate")
+		f.Comment("with -engine-fallback, or validate with the jsonschema engine.")
 	}
 	f.Func().Params(jen.Id("x").Op("*").Id(d.Name)).Id("Validate").Params().Error().Block(body...)
 }
 
-// hasUnenforced reports whether a schema uses conditional/combinator keywords
-// that the code generator does not yet mirror in Validate.
-func hasUnenforced(s *ir.Schema) bool {
-	return s.If != nil || s.Then != nil || s.Else != nil ||
-		len(s.DependentSchemas) > 0 || s.Not != nil || len(s.AllOf) > 0
+// ifHandled reports whether a struct's if/then/else is a string-discriminator
+// with required-only then/else branches — the subset we mirror idiomatically.
+func (e *emitter) ifHandled(d *gotype.Decl) bool {
+	s := d.Schema
+	if s.If == nil {
+		return false
+	}
+	if !isStringDiscriminator(s.If) {
+		return false
+	}
+	if s.Then != nil && !isRequiredOnly(s.Then) {
+		return false
+	}
+	if s.Else != nil && !isRequiredOnly(s.Else) {
+		return false
+	}
+	byJSON := fieldsByJSON(d)
+	for name := range s.If.Properties {
+		f, ok := byJSON[name]
+		if !ok || !isStringField(f) {
+			return false
+		}
+	}
+	return true
+}
+
+// isStringDiscriminator reports whether sch is `{properties: {P: const/enum
+// string, ...}}` and nothing else — a tag check on one or more string fields.
+func isStringDiscriminator(sch *ir.Schema) bool {
+	if sch.IsBoolean() || len(sch.Properties) == 0 {
+		return false
+	}
+	if sch.Ref != "" || sch.Not != nil || sch.If != nil ||
+		len(sch.AllOf) > 0 || len(sch.AnyOf) > 0 || len(sch.OneOf) > 0 ||
+		len(sch.Required) > 0 || !sch.Type.Empty() {
+		return false
+	}
+	for _, ps := range sch.Properties {
+		if stringDiscriminatorValues(ps) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// stringDiscriminatorValues returns the string values a property must equal
+// (from const or enum), or nil if it is not a simple string match.
+func stringDiscriminatorValues(ps *ir.Schema) []string {
+	if ps.Const != nil {
+		if s, ok := (*ps.Const).(string); ok {
+			return []string{s}
+		}
+		return nil
+	}
+	if len(ps.Enum) > 0 {
+		vals := make([]string, 0, len(ps.Enum))
+		for _, v := range ps.Enum {
+			s, ok := v.(string)
+			if !ok {
+				return nil
+			}
+			vals = append(vals, s)
+		}
+		return vals
+	}
+	return nil
+}
+
+// isRequiredOnly reports whether sch constrains nothing but `required`.
+func isRequiredOnly(sch *ir.Schema) bool {
+	if sch.IsBoolean() || len(sch.Required) == 0 {
+		return false
+	}
+	return len(sch.Properties) == 0 && sch.If == nil && sch.Not == nil &&
+		len(sch.AllOf) == 0 && len(sch.AnyOf) == 0 && len(sch.OneOf) == 0
+}
+
+func isStringField(f *gotype.Field) bool {
+	return f.Type.Named == "" && f.Type.Slice == nil && f.Type.Map == nil && f.Type.Prim == "string"
+}
+
+func fieldsByJSON(d *gotype.Decl) map[string]*gotype.Field {
+	m := make(map[string]*gotype.Field, len(d.Fields))
+	for _, f := range d.Fields {
+		m[f.JSONName] = f
+	}
+	return m
+}
+
+// emitIfThenElse emits the discriminator branch: if the tag fields match, the
+// `then` required properties apply; otherwise the `else` required properties do.
+func (e *emitter) emitIfThenElse(d *gotype.Decl) []jen.Code {
+	s := d.Schema
+	byJSON := fieldsByJSON(d)
+
+	var cond *jen.Statement
+	for _, name := range sortedStrings(keysOf(s.If.Properties)) {
+		term := discriminatorTerm(byJSON[name], stringDiscriminatorValues(s.If.Properties[name]))
+		if cond == nil {
+			cond = term
+		} else {
+			cond = cond.Op("&&").Add(term)
+		}
+	}
+
+	thenChecks := requiredPresenceChecks(byJSON, s.Then)
+	if len(thenChecks) == 0 {
+		thenChecks = []jen.Code{jen.Comment("no additional requirements")}
+	}
+	stmt := jen.If(cond).Block(thenChecks...)
+	if elseChecks := requiredPresenceChecks(byJSON, s.Else); len(elseChecks) > 0 {
+		stmt = stmt.Else().Block(elseChecks...)
+	}
+	return []jen.Code{stmt}
+}
+
+// discriminatorTerm builds `(x.F == nil || *x.F == v1 || ...)` for a pointer
+// field, or `(x.F == v1 || ...)` for a required one.
+func discriminatorTerm(fld *gotype.Field, vals []string) *jen.Statement {
+	value := func() *jen.Statement {
+		if fld.Type.Pointer {
+			return jen.Op("*").Id("x").Dot(fld.Name)
+		}
+		return jen.Id("x").Dot(fld.Name)
+	}
+	var parts []*jen.Statement
+	if fld.Type.Pointer {
+		parts = append(parts, jen.Id("x").Dot(fld.Name).Op("==").Nil())
+	}
+	for _, v := range vals {
+		parts = append(parts, value().Op("==").Lit(v))
+	}
+	expr := parts[0]
+	for _, p := range parts[1:] {
+		expr = expr.Op("||").Add(p)
+	}
+	return jen.Parens(expr)
+}
+
+// requiredPresenceChecks emits a presence check per required property of sch.
+func requiredPresenceChecks(byJSON map[string]*gotype.Field, sch *ir.Schema) []jen.Code {
+	if sch == nil {
+		return nil
+	}
+	var out []jen.Code
+	for _, name := range sch.Required {
+		f, ok := byJSON[name]
+		if !ok {
+			continue
+		}
+		if missing := absentExpr(f); missing != nil {
+			out = append(out, jen.If(missing).Block(
+				jen.Return(jen.Qual("fmt", "Errorf").Call(jen.Lit(fmt.Sprintf("%q is required here", name)))),
+			))
+		}
+	}
+	return out
 }
 
 // emitDelegatingValidate emits a Validate that defers to the runtime engine,

@@ -33,24 +33,36 @@ anonymous subschema.
 
 ## How idiomatic is inline mirroring, keyword by keyword?
 
-| Keyword | Faithful inline form | Divergence from idiomatic Go |
-|---|---|---|
-| `allOf` of object schemas | struct embedding: `type X struct { A; B }` | **Low** — embedding is idiomatic; only the `UnmarshalJSON`/`Validate` wiring needs care |
-| `if` = a `const`/`enum` discriminator on a property | a Go `if`/`switch` on that field | **Low** — but detecting and restricting to this subset is fiddly and covers only some schemas |
-| `dependentSchemas` where the subschema only adds `required` | `if x.P != nil && x.Q == nil { … }` | **Low** — same shape as `dependentRequired` |
-| general `if` / `then` / `else` | a `satisfiesIf() bool` predicate running full validation | **High** — anonymous predicate methods that map to no domain concept |
-| general `not` | a `matches() bool` predicate, negated | **High** — `not` rarely corresponds to any Go construct |
-| general `dependentSchemas` | a predicate for the dependent subschema | **High** — same as general `if` |
+| Keyword | Faithful inline form | Divergence | Status |
+|---|---|---|---|
+| `allOf` of object schemas | struct embedding: `type X struct { A; B }` | **Low** | **inline** |
+| `if` = `const`/`enum` string discriminator, `then`/`else` add `required` | a Go `if`/`else` on that field | **Low** | **inline** |
+| general `if` / `then` / `else` | a `satisfiesIf() bool` predicate running full validation | **High** | fallback |
+| general `not` | a `matches() bool` predicate, negated | **High** | fallback |
+| `dependentSchemas` | a predicate for the dependent subschema | **High** | fallback |
 
-The high-divergence cases share one property: they need the answer to "does an
-arbitrary value match an arbitrary subschema?" There is no nominal Go type that
-represents that question, so the generated code becomes a compiled interpreter —
+The two low-divergence rows are now emitted inline (see below). The high-
+divergence cases share one property: they need the answer to "does an arbitrary
+value match an arbitrary subschema?" There is no nominal Go type that represents
+that question, so the generated code would become a compiled interpreter —
 verbose, hard to read, and offering nothing over just *calling* the interpreter.
+Those stay on the engine fallback by design.
 
 ## What we do
 
-We refuse to emit the high-divergence code, and instead offer two honest modes,
-selected per generation:
+The two low-divergence cases are emitted inline as idiomatic Go:
+
+- **`allOf`** of object schemas becomes struct embedding. `type X struct { A; B }`
+  promotes both parts' fields; `UnmarshalJSON` decodes each part from the full
+  object (so each part enforces its own `required`), and `Validate` calls each
+  part's `Validate`.
+- **A string-discriminator `if`** (`{"if": {"properties": {"kind": {"const":
+  "secret"}}}, "then": {"required": ["value"]}}`) becomes a plain conditional:
+  `if x.Kind == nil || *x.Kind == "secret" { if x.Value == nil { … } }`, matching
+  the spec's "`properties` does not require presence" semantics.
+
+For everything else, we refuse to emit the high-divergence code and instead offer
+two honest modes, selected per generation:
 
 1. **Default** — generate the type and an inline `Validate` for the keywords that
    mirror cleanly. Emit a `NOTE` comment when a type uses an unmirrored keyword.
@@ -81,13 +93,19 @@ need conformance on conditional schemas get it without forcing the engine
 dependency on everyone. The runtime engine is always available directly, too
 (`jsonschema.Compile(...).Validate(...)`), and passes the test suite at 100%.
 
-## Possible future work (idiomatic, inline)
+## Boundaries of the inline handling
 
-The two **low-divergence** rows above are worth doing inline later, which would
-shrink how often the fallback is needed:
+The inline paths are deliberately conservative — when a schema falls outside the
+recognized shape, it drops to the default/​fallback behavior rather than emitting
+something subtly wrong:
 
-- `allOf` of object schemas → struct embedding.
-- `if` as a `const`/`enum` discriminator → a Go `if`/`switch`, closely related to
-  the existing `oneOf` interface handling.
+- `allOf` embedding requires every member to be an object schema (or a `$ref` to
+  one). Overlapping field names across members marshal per Go's embedding rules
+  (ambiguous promoted fields are dropped from marshaling); disjoint compositions
+  are the clean, common case.
+- The discriminator `if` requires the `if` to be `properties` of `const`/`enum`
+  **string** matches and the `then`/`else` to constrain only `required`. A
+  numeric discriminator, a nested `then`, or any other keyword falls through to
+  the fallback.
 
-The general cases would remain on the engine fallback by design.
+Everything else remains on the engine fallback by design.

@@ -39,6 +39,11 @@ type Decl struct {
 	Variants   []*TypeRef // Kind == Interface (each is a Named variant type)
 	Exclusive  bool       // Kind == Interface: true for oneOf, false for anyOf
 	Tuple      bool       // Kind == Struct: positional array (prefixItems)
+	Embeds     []*TypeRef // Kind == Struct: embedded types from allOf
+
+	// AllOfHandled records that allOf was enforced idiomatically (via embedding),
+	// so it needs no engine fallback.
+	AllOfHandled bool
 }
 
 // Field is one struct field.

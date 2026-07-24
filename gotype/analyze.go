@@ -114,6 +114,9 @@ func (a *analyzer) build(d *Decl) error {
 		a.buildInterface(d, s.OneOf, true)
 	case len(s.AnyOf) > 0:
 		a.buildInterface(d, s.AnyOf, false)
+	case a.allOfEmbeddable(s):
+		d.Kind = Struct
+		return a.buildStruct(d)
 	case isObject(s) && len(s.Properties) == 0:
 		// An object with no declared properties is a dictionary type.
 		d.Kind = Alias
@@ -266,7 +269,37 @@ func (a *analyzer) buildStruct(d *Decl) error {
 		}
 		d.Fields = append(d.Fields, f)
 	}
+
+	// allOf of object schemas is modeled by embedding each member type.
+	if a.allOfEmbeddable(d.Schema) {
+		for i, m := range d.Schema.AllOf {
+			d.Embeds = append(d.Embeds, a.typeRef(m, fmt.Sprintf("%sPart%d", d.Name, i+1)))
+		}
+		d.AllOfHandled = true
+	}
 	return nil
+}
+
+// allOfEmbeddable reports whether every allOf member is an object schema (or a
+// $ref to one), so the composition can be expressed as Go struct embedding.
+func (a *analyzer) allOfEmbeddable(s *ir.Schema) bool {
+	if len(s.AllOf) == 0 || len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
+		return false
+	}
+	for _, m := range s.AllOf {
+		target := m
+		if m.Ref != "" {
+			r, err := a.res.Resolve(m.BaseURI, m.Ref)
+			if err != nil {
+				return false
+			}
+			target = r
+		}
+		if !isObject(target) {
+			return false
+		}
+	}
+	return true
 }
 
 // typeRef computes the Go type of a subschema, creating nested named types
@@ -292,6 +325,8 @@ func (a *analyzer) typeRef(s *ir.Schema, hint string) *TypeRef {
 	case len(s.Enum) > 0 || s.Const != nil:
 		return &TypeRef{Named: a.declare(hint, s)}
 	case len(s.OneOf) > 0 || len(s.AnyOf) > 0:
+		return &TypeRef{Named: a.declare(hint, s)}
+	case a.allOfEmbeddable(s):
 		return &TypeRef{Named: a.declare(hint, s)}
 	case isObject(s) && len(s.Properties) == 0:
 		return a.mapType(s)

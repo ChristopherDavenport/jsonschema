@@ -89,10 +89,22 @@ func TestGeneratedNumeric(t *testing.T) {
 	runInModule(t, numSchema, Config{Package: "gentest", RootName: "Numbers"}, numTest)
 }
 
-// TestGeneratedEngineFallback proves that with EngineFallback, if/then/else is
-// actually enforced (via the embedded schema + runtime engine).
+// TestGeneratedDiscriminator proves a string-discriminator if/then is enforced
+// inline (no engine fallback), the idiomatic path.
+func TestGeneratedDiscriminator(t *testing.T) {
+	runInModule(t, condSchema, Config{Package: "gentest", RootName: "Item"}, condTest)
+}
+
+// TestGeneratedEngineFallback proves that with EngineFallback, a keyword that is
+// never mirrored inline (dependentSchemas) is enforced via the runtime engine.
 func TestGeneratedEngineFallback(t *testing.T) {
-	runInModule(t, condSchema, Config{Package: "gentest", RootName: "Item", EngineFallback: true}, condTest)
+	runInModule(t, fallbackSchema, Config{Package: "gentest", RootName: "Item", EngineFallback: true}, fallbackTest)
+}
+
+// TestGeneratedAllOf proves allOf is modeled as struct embedding with each
+// part's required fields and Validate enforced.
+func TestGeneratedAllOf(t *testing.T) {
+	runInModule(t, allOfSchema, Config{Package: "gentest", RootName: "Record"}, allOfTest)
 }
 
 // runInModule generates code, drops it into a temp module, and runs its tests.
@@ -335,6 +347,77 @@ func TestEngineFallback(t *testing.T) {
 	other := mustDecode(` + "`" + `{"kind":"public"}` + "`" + `)
 	if err := other.Validate(); err != nil {
 		t.Fatalf("non-secret should be valid: %v", err)
+	}
+}
+`
+
+const allOfSchema = `{
+  "allOf": [{"$ref": "#/$defs/base"}, {"$ref": "#/$defs/audit"}],
+  "$defs": {
+    "base": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}, "name": {"type": "string", "minLength": 1}}},
+    "audit": {"type": "object", "required": ["createdBy"], "properties": {"createdBy": {"type": "string"}}}
+  }
+}`
+
+const allOfTest = `package gentest
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestAllOf(t *testing.T) {
+	var r Record
+	if err := json.Unmarshal([]byte(` + "`" + `{"id":"1","name":"x","createdBy":"me"}` + "`" + `), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.ID != "1" || r.CreatedBy != "me" { // promoted from Base and Audit
+		t.Fatalf("promoted fields wrong: %+v", r)
+	}
+	if err := r.Validate(); err != nil {
+		t.Fatalf("valid record rejected: %v", err)
+	}
+	if err := json.Unmarshal([]byte(` + "`" + `{"id":"1"}` + "`" + `), &r); err == nil {
+		t.Fatal("missing createdBy (from Audit) should fail")
+	}
+	if err := json.Unmarshal([]byte(` + "`" + `{"createdBy":"me"}` + "`" + `), &r); err == nil {
+		t.Fatal("missing id (from Base) should fail")
+	}
+}
+`
+
+const fallbackSchema = `{
+  "type": "object",
+  "properties": {"kind": {"type": "string"}, "value": {"type": "string"}},
+  "dependentSchemas": {"kind": {"required": ["value"]}}
+}`
+
+const fallbackTest = `package gentest
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestEngineFallback(t *testing.T) {
+	dec := func(s string) Item {
+		var x Item
+		if err := json.Unmarshal([]byte(s), &x); err != nil {
+			t.Fatalf("unmarshal %s: %v", s, err)
+		}
+		return x
+	}
+	ok := dec(` + "`" + `{"kind":"x","value":"y"}` + "`" + `)
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("kind+value should be valid: %v", err)
+	}
+	bad := dec(` + "`" + `{"kind":"x"}` + "`" + `)
+	if bad.Validate() == nil {
+		t.Fatal("kind present without value should fail dependentSchemas")
+	}
+	none := dec(` + "`" + `{"value":"y"}` + "`" + `)
+	if err := none.Validate(); err != nil {
+		t.Fatalf("no kind should be valid: %v", err)
 	}
 }
 `

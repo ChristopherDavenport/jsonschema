@@ -47,9 +47,10 @@ Legend: ✅ validated · ⚙️ typed only · ❌ ignored/absent.
 | `minProperties`/`maxProperties` | ✅ | ❌ |
 | `dependentRequired` | ✅ (validate + **generate**) | ❌ |
 | `oneOf` (interface + variants) | ✅ (validate + **generate**) | ❌ |
-| `anyOf` / `allOf` / `not` | ✅ | partial |
-| `if` / `then` / `else` | ✅ | ❌ |
-| `dependentSchemas` | ✅ | ❌ |
+| `anyOf` / `not` | ✅ | partial |
+| `allOf` (validate + **generate** via embedding) | ✅ | partial |
+| `if` / `then` / `else` (discriminator generated inline; rest via fallback) | ✅ | ❌ |
+| `dependentSchemas` (validate; generate via fallback) | ✅ | ❌ |
 | `patternProperties` | ✅ | ❌ |
 | `propertyNames` | ✅ | ❌ |
 | `prefixItems` / tuples | ✅ (validate + **generate**) | ❌ |
@@ -113,11 +114,17 @@ sealed marker interfaces** with generated variant dispatch (`Unmarshal<Name>`).
 
 The generated `Validate` mirrors the engine inline for type, presence,
 scalar/array assertions, `format`, `uniqueItems`, `dependentRequired`,
-`oneOf`/`anyOf`, and nested validation. The in-place conditional and combinator
-keywords — `if`/`then`/`else`, `dependentSchemas`, `not`, and `allOf` — are
-handled differently, because faithfully mirroring an *arbitrary* subschema as a
-boolean predicate over a nominal Go type means re-implementing the validator as
-generated code, which stops looking like idiomatic Go. There are two modes:
+`oneOf`/`anyOf`, and nested validation. Two combinator/conditional cases are also
+emitted as idiomatic Go:
+
+- **`allOf`** of object schemas → struct embedding (`type X struct { A; B }`),
+  with each part enforcing its own `required` and `Validate`.
+- **A string-discriminator `if`** (`{"if":{"properties":{"kind":{"const":"x"}}},
+  "then":{"required":[…]}}`) → a plain `if x.Kind == … { … }`.
+
+The remaining cases — general `if`/`then`/`else`, `dependentSchemas`, and `not` —
+would require re-implementing the validator as generated boolean predicates,
+which stops looking like idiomatic Go. For those there are two modes:
 
 - **Default:** the type and a `Validate` method are still generated, but these
   keywords are not enforced; a `NOTE` comment is emitted above the method. The
