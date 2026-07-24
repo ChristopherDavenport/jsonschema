@@ -1,0 +1,47 @@
+jsonschema
+Copyright (c) 2026 Christopher Davenport
+
+This product includes and/or depends on third-party software. Their copyright
+notices and license terms are reproduced below.
+
+================================================================================
+Bundled content
+================================================================================
+
+JSON Schema Test Suite
+  Source:  https://github.com/json-schema-org/JSON-Schema-Test-Suite
+  Used as: a git submodule under third_party/JSON-Schema-Test-Suite, for
+           conformance testing only (not shipped in the importable packages).
+  License: MIT License
+  Copyright (c) 2012 Julian Berman
+
+JSON Schema meta-schemas
+  Source:  https://json-schema.org/ (drafts 2020-12, 2019-09, and draft-07)
+  Used as: verbatim copies embedded under metaschema/, so that documents which
+           reference an official meta-schema can be validated offline.
+  These files are the official meta-schemas published by the JSON Schema
+  project and are redistributed here unmodified for that purpose. See
+  https://json-schema.org/specification for the specifications and their terms.
+
+================================================================================
+Go module dependencies
+================================================================================
+
+github.com/dave/jennifer
+  Used by: the code generator (source emission).
+  License: MIT License
+  Copyright (c) 2017 David Brophy
+
+gopkg.in/yaml.v3
+  Used by: the command-line generator (YAML config file parsing).
+  License: MIT License and Apache License 2.0 (dual-licensed)
+  Copyright 2011-2016 Canonical Ltd.
+  Copyright 2006-2010 Kirill Simonov (libyaml portions ported to Go)
+
+================================================================================
+Acknowledgements
+================================================================================
+
+The design was informed by studying prior art in the Go ecosystem, including
+omissis/go-jsonschema and santhosh-tekuri/jsonschema. No code from those
+projects is included in this repository.

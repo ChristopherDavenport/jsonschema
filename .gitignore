@@ -1,0 +1,18 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Scratch
+/tmp/
+*.local
