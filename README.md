@@ -20,6 +20,7 @@ the same schema, backed by the same engine so they never disagree.
 - [Install](#install)
 - [Runtime validation](#runtime-validation)
 - [Code generation, from simple to complex](#code-generation-from-simple-to-complex)
+- [Using the generated code](#using-the-generated-code)
 - [The `x-go` extension](#the-x-go-extension)
 - [Conditional and combinator keywords](#conditional-and-combinator-keywords)
 - [Conformance](#conformance)
@@ -455,6 +456,87 @@ func (x *Item) Validate() error {
 	return nil
 }
 ```
+
+## Using the generated code
+
+Generate into a package inside your module and import it like any other. The
+`-package` flag names the package; the output file goes wherever you point `-o`:
+
+```go
+//go:generate jsonschema-gen -package schema -root Order -o schema/order.gen.go order.schema.json
+```
+
+```go
+import "example.com/app/schema"
+```
+
+**Decode and validate.** The generated `UnmarshalJSON` enforces required
+properties as it decodes; call `Validate` for everything else. The two are
+separate on purpose — decoding tells you the shape is right, `Validate` tells you
+the values are.
+
+```go
+var u schema.User
+if err := json.Unmarshal(data, &u); err != nil {
+	// e.g. missing required "email"
+}
+if err := u.Validate(); err != nil {
+	// e.g. a constraint violation
+}
+```
+
+**Construct values yourself.** The types are ordinary structs — build them with
+literals. Optional fields are pointers, enums are typed constants, and `Validate`
+/ `json.Marshal` work on values you make, not just ones you decode.
+
+```go
+name := "Ada"
+role := schema.AccountRoleAdmin // typed enum constant
+acct := schema.Account{
+	ID:   "550e8400-e29b-41d4-a716-446655440000",
+	Name: name,
+	Role: &role, // optional field -> pointer
+}
+_ = acct.Validate() // <nil>
+b, _ := json.Marshal(acct)
+// {"id":"550e8400-e29b-41d4-a716-446655440000","name":"Ada","role":"admin"}
+```
+
+**Set a `oneOf` field.** Assign a concrete variant to the interface field — that
+is all the marker interface asks of you. It marshals as its underlying object and
+decodes back to the same concrete type, which you recover with a type switch. (If
+you already hold the raw JSON for just that field, `UnmarshalOrderPayment(raw)`
+returns the variant directly.)
+
+```go
+order := schema.Order{Payment: &schema.Card{CardNumber: "4111111111111111"}}
+b, _ := json.Marshal(order)
+// {"payment":{"cardNumber":"4111111111111111"}}
+
+var back schema.Order
+_ = json.Unmarshal(b, &back)
+switch p := back.Payment.(type) {
+case *schema.Card:
+	useCard(p)
+case *schema.Bank:
+	useBank(p)
+}
+```
+
+**Fill an `allOf` composition.** Embedded parts promote their fields, so you set
+them directly and marshal to one flat object.
+
+```go
+var rec schema.Record
+rec.ID = "r-1"        // promoted from Base
+rec.CreatedBy = "ada" // promoted from Audit
+_ = rec.Validate()
+b, _ := json.Marshal(rec)
+// {"id":"r-1","createdBy":"ada"}
+```
+
+All output comments above are the real results of running this code against the
+generated types.
 
 ## The `x-go` extension
 
