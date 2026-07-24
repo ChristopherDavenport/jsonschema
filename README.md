@@ -109,25 +109,34 @@ bounds/`multipleOf`, `uniqueItems`, `dependentRequired`, `additionalProperties`
 dictionaries (`map[string]T`), `prefixItems` tuples (array-shaped
 `(Un)MarshalJSON`), the `x-go` type-override extension, and **`oneOf`/`anyOf` as
 sealed marker interfaces** with generated variant dispatch (`Unmarshal<Name>`).
-### Generator limitations
+### Conditional and combinator keywords
 
-The generated `Validate` mirrors the engine for type, presence, scalar/array
-assertions, `format`, `uniqueItems`, `dependentRequired`, `oneOf`/`anyOf`, and
-nested validation. It does **not yet** enforce the in-place conditional and
-combinator keywords — `if`/`then`/`else`, `dependentSchemas`, `not`, and
-`allOf` — because faithfully mirroring an arbitrary subschema against a nominal
-Go type is substantially harder than the value-level checks. When a schema uses
-one of these, the generator still emits the types and a `Validate` method, and
-adds a `NOTE` comment above that method.
+The generated `Validate` mirrors the engine inline for type, presence,
+scalar/array assertions, `format`, `uniqueItems`, `dependentRequired`,
+`oneOf`/`anyOf`, and nested validation. The in-place conditional and combinator
+keywords — `if`/`then`/`else`, `dependentSchemas`, `not`, and `allOf` — are
+handled differently, because faithfully mirroring an *arbitrary* subschema as a
+boolean predicate over a nominal Go type means re-implementing the validator as
+generated code, which stops looking like idiomatic Go. There are two modes:
 
-Until generated enforcement lands (a likely approach is a small hybrid that
-defers just these keywords to the embedded schema + runtime engine), validate
-such documents with the runtime engine for full coverage:
+- **Default:** the type and a `Validate` method are still generated, but these
+  keywords are not enforced; a `NOTE` comment is emitted above the method. The
+  generated package depends only on the standard library and `xvalid`.
+- **`-engine-fallback`:** for any type that uses one of these keywords, `Validate`
+  delegates to the embedded schema evaluated by the runtime engine — full
+  conformance, at the cost of a dependency on the `jsonschema` package and a
+  marshal round-trip. The generated *types* stay idiomatic; only their `Validate`
+  changes. This is opt-in per generation.
+
+Either way, you can always validate with the runtime engine directly:
 
 ```go
 s, _ := jsonschema.Compile(schemaBytes)
 err := s.Validate(decodedInstance)
 ```
+
+See [docs/conditionals.md](./docs/conditionals.md) for the full design rationale
+and the tradeoff analysis.
 
 ### The `x-go` extension
 

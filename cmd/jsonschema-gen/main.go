@@ -28,8 +28,9 @@ type fileConfig struct {
 	RootName     *string `yaml:"rootName"`
 	BaseURI      *string `yaml:"baseURI"`
 	AssertFormat *bool   `yaml:"assertFormat"`
-	Input        *string `yaml:"input"`
-	Output       *string `yaml:"output"`
+	Input          *string `yaml:"input"`
+	Output         *string `yaml:"output"`
+	EngineFallback *bool   `yaml:"engineFallback"`
 }
 
 func main() {
@@ -45,6 +46,7 @@ func run() error {
 	out := flag.String("o", "", "output file (default: stdout)")
 	assertFormat := flag.Bool("assert-format", false, "emit `format` assertions in Validate methods")
 	baseURI := flag.String("base-uri", "", "base URI used to resolve references")
+	engineFallback := flag.Bool("engine-fallback", false, "for types using if/then/else, dependentSchemas, not, or allOf, delegate Validate to the embedded schema + runtime engine (full conformance, adds a dependency on the jsonschema package)")
 	configPath := flag.String("config", "", "YAML config file (flags override its values)")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: jsonschema-gen [flags] <schema.json>")
@@ -77,6 +79,9 @@ func run() error {
 		if !set["o"] && fc.Output != nil {
 			*out = *fc.Output
 		}
+		if !set["engine-fallback"] && fc.EngineFallback != nil {
+			*engineFallback = *fc.EngineFallback
+		}
 		if input == "" && fc.Input != nil {
 			input = *fc.Input
 		}
@@ -93,10 +98,11 @@ func run() error {
 	}
 
 	src, err := gen.Generate(gen.Config{
-		Package:      *pkg,
-		RootName:     *root,
-		BaseURI:      *baseURI,
-		AssertFormat: *assertFormat,
+		Package:        *pkg,
+		RootName:       *root,
+		BaseURI:        *baseURI,
+		AssertFormat:   *assertFormat,
+		EngineFallback: *engineFallback,
 	}, data)
 	if err != nil {
 		return err

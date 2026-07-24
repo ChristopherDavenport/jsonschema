@@ -89,6 +89,12 @@ func TestGeneratedNumeric(t *testing.T) {
 	runInModule(t, numSchema, Config{Package: "gentest", RootName: "Numbers"}, numTest)
 }
 
+// TestGeneratedEngineFallback proves that with EngineFallback, if/then/else is
+// actually enforced (via the embedded schema + runtime engine).
+func TestGeneratedEngineFallback(t *testing.T) {
+	runInModule(t, condSchema, Config{Package: "gentest", RootName: "Item", EngineFallback: true}, condTest)
+}
+
 // runInModule generates code, drops it into a temp module, and runs its tests.
 func runInModule(t *testing.T, schema string, cfg Config, testSrc string) {
 	t.Helper()
@@ -290,6 +296,45 @@ func TestNumeric(t *testing.T) {
 	d.Count = &odd
 	if d.Validate() == nil {
 		t.Fatal("3 should fail multipleOf 2")
+	}
+}
+`
+
+const condSchema = `{
+  "type": "object",
+  "properties": {"kind": {"type": "string"}, "value": {"type": "string"}},
+  "if": {"properties": {"kind": {"const": "secret"}}},
+  "then": {"required": ["value"]}
+}`
+
+const condTest = `package gentest
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestEngineFallback(t *testing.T) {
+	mustDecode := func(s string) Item {
+		var x Item
+		if err := json.Unmarshal([]byte(s), &x); err != nil {
+			t.Fatalf("unmarshal %s: %v", s, err)
+		}
+		return x
+	}
+	// kind=secret requires value.
+	ok := mustDecode(` + "`" + `{"kind":"secret","value":"x"}` + "`" + `)
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("secret+value should be valid: %v", err)
+	}
+	bad := mustDecode(` + "`" + `{"kind":"secret"}` + "`" + `)
+	if bad.Validate() == nil {
+		t.Fatal("secret without value should fail if/then")
+	}
+	// kind!=secret has no requirement.
+	other := mustDecode(` + "`" + `{"kind":"public"}` + "`" + `)
+	if err := other.Validate(); err != nil {
+		t.Fatalf("non-secret should be valid: %v", err)
 	}
 }
 `

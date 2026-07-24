@@ -26,6 +26,11 @@ type Config struct {
 	AssertFormat bool
 	// DefaultDraft is assumed when the document has no $schema keyword.
 	DefaultDraft dialect.Draft
+	// EngineFallback makes Validate for types that use keywords the generator
+	// cannot mirror inline (if/then/else, dependentSchemas, not, allOf) delegate
+	// to the embedded schema + runtime engine, trading a dependency on the
+	// jsonschema package for full conformance.
+	EngineFallback bool
 }
 
 // Generate parses a schema document and returns formatted Go source.
@@ -55,6 +60,7 @@ func Generate(cfg Config, data []byte) ([]byte, error) {
 	return (&emitter{
 		cfg:         cfg,
 		model:       model,
+		docBytes:    data,
 		hasValidate: map[string]bool{},
 		isInterface: map[string]bool{},
 	}).emit()

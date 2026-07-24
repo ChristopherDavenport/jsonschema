@@ -19,9 +19,19 @@ const xvalidPkg = "github.com/ChristopherDavenport/jsonschema/xvalid"
 type emitter struct {
 	cfg         Config
 	model       *gotype.Model
+	docBytes    []byte
 	hasValidate map[string]bool
 	isInterface map[string]bool
 	patterns    []patternVar
+	needEngine  bool // an engine-fallback helper block must be emitted
+}
+
+const enginePkg = "github.com/ChristopherDavenport/jsonschema"
+
+// hybrid reports whether a declaration's Validate should delegate to the
+// runtime engine rather than mirror the schema inline.
+func (e *emitter) hybrid(d *gotype.Decl) bool {
+	return e.cfg.EngineFallback && d.Schema != nil && hasUnenforced(d.Schema)
 }
 
 type patternVar struct {
@@ -58,6 +68,10 @@ func (e *emitter) emit() ([]byte, error) {
 
 	for _, p := range e.patterns {
 		f.Var().Id(p.name).Op("=").Qual(xvalidPkg, "MustCompilePattern").Call(jen.Lit(p.pattern))
+	}
+
+	if e.needEngine {
+		e.emitEngineHelpers(f)
 	}
 
 	var buf bytes.Buffer
@@ -253,6 +267,10 @@ func splitTag(s string) (key, value string, ok bool) {
 }
 
 func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
+	if e.hybrid(d) {
+		e.emitDelegatingValidate(f, d)
+		return
+	}
 	var body []jen.Code
 	for _, fld := range d.Fields {
 		checks := e.fieldChecks(fld)
@@ -282,6 +300,49 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 func hasUnenforced(s *ir.Schema) bool {
 	return s.If != nil || s.Then != nil || s.Else != nil ||
 		len(s.DependentSchemas) > 0 || s.Not != nil || len(s.AllOf) > 0
+}
+
+// emitDelegatingValidate emits a Validate that defers to the runtime engine,
+// validating the marshaled value against this type's subschema by location.
+func (e *emitter) emitDelegatingValidate(f *jen.File, d *gotype.Decl) {
+	e.needEngine = true
+	f.Func().Params(jen.Id("x").Op("*").Id(d.Name)).Id("Validate").Params().Error().Block(
+		jen.Return(jen.Id("validateAgainstSchema").Call(jen.Lit(d.Schema.Location), jen.Id("x"))),
+	)
+}
+
+// emitEngineHelpers emits the shared block that compiles the embedded schema
+// once and validates a marshaled value against a subschema by location.
+func (e *emitter) emitEngineHelpers(f *jen.File) {
+	f.Comment("The embedded schema and engine below back the Validate methods of")
+	f.Comment("types that use keywords not mirrored inline (if/then/else,")
+	f.Comment("dependentSchemas, not, allOf).")
+	f.Const().Id("schemaBaseURI").Op("=").Lit(e.cfg.BaseURI)
+	f.Var().Id("schemaDocument").Op("=").Lit(string(e.docBytes))
+
+	compilerBody := []jen.Code{jen.Id("c").Op(":=").Qual(enginePkg, "NewCompiler").Call()}
+	if e.cfg.AssertFormat {
+		compilerBody = append(compilerBody, jen.Id("c").Dot("AssertFormat").Call(jen.True()))
+	}
+	compilerBody = append(compilerBody,
+		jen.Id("_").Op("=").Id("c").Dot("AddResource").Call(jen.Id("schemaBaseURI"), jen.Index().Byte().Call(jen.Id("schemaDocument"))),
+		jen.Return(jen.Id("c")),
+	)
+	f.Var().Id("schemaCompiler").Op("=").Qual("sync", "OnceValue").Call(
+		jen.Func().Params().Op("*").Qual(enginePkg, "Compiler").Block(compilerBody...),
+	)
+
+	f.Func().Id("validateAgainstSchema").Params(jen.Id("location").String(), jen.Id("v").Any()).Error().Block(
+		jen.List(jen.Id("s"), jen.Err()).Op(":=").Id("schemaCompiler").Call().Dot("Compile").Call(jen.Id("location")),
+		jen.If(jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())),
+		jen.List(jen.Id("b"), jen.Err()).Op(":=").Qual("encoding/json", "Marshal").Call(jen.Id("v")),
+		jen.If(jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())),
+		jen.Id("dec").Op(":=").Qual("encoding/json", "NewDecoder").Call(jen.Qual("bytes", "NewReader").Call(jen.Id("b"))),
+		jen.Id("dec").Dot("UseNumber").Call(),
+		jen.Var().Id("decoded").Any(),
+		jen.If(jen.Err().Op(":=").Id("dec").Dot("Decode").Call(jen.Op("&").Id("decoded")), jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())),
+		jen.Return(jen.Id("s").Dot("Validate").Call(jen.Id("decoded"))),
+	)
 }
 
 // dependentRequiredChecks emits, for each trigger property that is present, a
