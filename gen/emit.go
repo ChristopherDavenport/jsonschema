@@ -101,9 +101,7 @@ func (e *emitter) emit() ([]byte, error) {
 }
 
 func (e *emitter) emitStruct(f *jen.File, d *gotype.Decl) {
-	if d.Doc != "" {
-		f.Comment(d.Name + " " + d.Doc)
-	}
+	f.Comment(typeDoc(d.Name, d.Doc))
 	fields := make([]jen.Code, 0, len(d.Fields)+len(d.Embeds))
 	for _, emb := range d.Embeds {
 		fields = append(fields, jen.Id(emb.Named)) // embedded (anonymous) field
@@ -159,12 +157,14 @@ func (e *emitter) emitTupleMarshal(f *jen.File, d *gotype.Decl) {
 		).Block(jen.Return(jen.Err())))
 	}
 	body = append(body, jen.Return(jen.Nil()))
+	f.Comment("UnmarshalJSON decodes a JSON array into " + d.Name + "'s positional elements.")
 	f.Func().Params(jen.Id("x").Op("*").Id(d.Name)).Id("UnmarshalJSON").Params(jen.Id("data").Index().Byte()).Error().Block(body...)
 
 	elems := make([]jen.Code, n)
 	for i, fld := range d.Fields {
 		elems[i] = jen.Id("x").Dot(fld.Name)
 	}
+	f.Comment("MarshalJSON encodes " + d.Name + " as a JSON array.")
 	f.Func().Params(jen.Id("x").Id(d.Name)).Id("MarshalJSON").Params().Params(jen.Index().Byte(), jen.Error()).Block(
 		jen.Return(jen.Qual("encoding/json", "Marshal").Call(jen.Index().Any().Values(elems...))),
 	)
@@ -258,6 +258,7 @@ func (e *emitter) emitUnmarshal(f *jen.File, d *gotype.Decl) {
 	}
 	body = append(body, jen.Return(jen.Nil()))
 
+	f.Comment("UnmarshalJSON decodes data into " + d.Name + ", enforcing required properties.")
 	f.Func().Params(jen.Id("x").Op("*").Id(d.Name)).Id("UnmarshalJSON").
 		Params(jen.Id("data").Index().Byte()).Error().Block(body...)
 }
@@ -274,6 +275,15 @@ func (e *emitter) fieldType(fld *gotype.Field) *jen.Statement {
 // coreName returns the named type a TypeRef refers to (ignoring a pointer), or
 // "" if it is not a direct named reference.
 func coreName(t *gotype.TypeRef) string { return t.Named }
+
+// typeDoc builds a godoc comment for a generated type: the schema description
+// when present, and a sensible default otherwise, always leading with the name.
+func typeDoc(name, desc string) string {
+	if desc != "" {
+		return name + " " + desc
+	}
+	return name + " is generated from its JSON Schema."
+}
 
 func keysOf[V any](m map[string]V) []string {
 	ks := make([]string, 0, len(m))
@@ -330,9 +340,13 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 	// Warn when the schema uses keywords the generator does not enforce (and
 	// the engine fallback was not requested).
 	if e.needsFallback(d) {
+		f.Comment("Validate reports whether x satisfies the constraints this type mirrors inline.")
+		f.Comment("")
 		f.Comment("NOTE: this schema uses not, dependentSchemas, or a non-discriminator")
 		f.Comment("if/then/else that generated Validate does not enforce. Regenerate")
 		f.Comment("with -engine-fallback, or validate with the jsonschema engine.")
+	} else {
+		f.Comment("Validate reports whether x satisfies the schema.")
 	}
 	f.Func().Params(jen.Id("x").Op("*").Id(d.Name)).Id("Validate").Params().Error().Block(body...)
 }
@@ -500,6 +514,8 @@ func requiredPresenceChecks(byJSON map[string]*gotype.Field, sch *ir.Schema) []j
 // validating the marshaled value against this type's subschema by location.
 func (e *emitter) emitDelegatingValidate(f *jen.File, d *gotype.Decl) {
 	e.needEngine = true
+	f.Comment("Validate reports whether x satisfies the schema, delegating to the")
+	f.Comment("embedded schema and runtime engine for full conformance.")
 	f.Func().Params(jen.Id("x").Op("*").Id(d.Name)).Id("Validate").Params().Error().Block(
 		jen.Return(jen.Id("validateAgainstSchema").Call(jen.Lit(d.Schema.Location), jen.Id("x"))),
 	)
@@ -715,6 +731,7 @@ func fieldNumKind(fld *gotype.Field) string {
 }
 
 func (e *emitter) emitEnum(f *jen.File, d *gotype.Decl) {
+	f.Comment(typeDoc(d.Name, d.Doc))
 	f.Type().Id(d.Name).Add(e.typeCode(d.Underlying))
 	defs := make([]jen.Code, 0, len(d.Enum))
 	cases := make([]jen.Code, 0, len(d.Enum))
@@ -722,7 +739,9 @@ func (e *emitter) emitEnum(f *jen.File, d *gotype.Decl) {
 		defs = append(defs, jen.Id(ev.Ident).Id(d.Name).Op("=").Add(litValue(d.Underlying, ev.Value)))
 		cases = append(cases, jen.Id(ev.Ident))
 	}
+	f.Comment("The permitted " + d.Name + " values.")
 	f.Const().Defs(defs...)
+	f.Comment("Validate reports whether x is one of the permitted " + d.Name + " values.")
 	f.Func().Params(jen.Id("x").Id(d.Name)).Id("Validate").Params().Error().Block(
 		jen.Switch(jen.Id("x")).Block(
 			jen.Case(cases...).Block(jen.Return(jen.Nil())),
@@ -732,6 +751,7 @@ func (e *emitter) emitEnum(f *jen.File, d *gotype.Decl) {
 }
 
 func (e *emitter) emitAlias(f *jen.File, d *gotype.Decl) {
+	f.Comment(typeDoc(d.Name, d.Doc))
 	f.Type().Id(d.Name).Add(e.typeCode(d.Underlying))
 }
 
@@ -739,9 +759,7 @@ func (e *emitter) emitAlias(f *jen.File, d *gotype.Decl) {
 // method on each variant, and an Unmarshal<Name> dispatcher.
 func (e *emitter) emitInterface(f *jen.File, d *gotype.Decl) {
 	marker := "is" + d.Name
-	if d.Doc != "" {
-		f.Comment(d.Name + " " + d.Doc)
-	}
+	f.Comment(typeDoc(d.Name, d.Doc) + " It is a closed union implemented by its variant types.")
 	f.Type().Id(d.Name).Interface(jen.Id(marker).Params())
 
 	for _, v := range d.Variants {
@@ -787,6 +805,7 @@ func (e *emitter) emitUnmarshalInterface(f *jen.File, d *gotype.Decl) {
 	}
 	body = append(body, tail)
 
+	f.Comment("Unmarshal" + d.Name + " decodes data into whichever " + d.Name + " variant matches.")
 	f.Func().Id("Unmarshal"+d.Name).Params(jen.Id("data").Index().Byte()).Params(jen.Id(d.Name), jen.Error()).Block(body...)
 }
 

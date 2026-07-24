@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 )
 
+// Person is generated from its JSON Schema.
 type Person struct {
 	Address *Address    `json:"address,omitempty"`
 	Age     *int64      `json:"age,omitempty"`
@@ -19,6 +20,7 @@ type Person struct {
 	Tags    []string    `json:"tags,omitempty"`
 }
 
+// UnmarshalJSON decodes data into Person, enforcing required properties.
 func (x *Person) UnmarshalJSON(data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -51,6 +53,8 @@ func (x *Person) UnmarshalJSON(data []byte) error {
 	x.Tags = sh.Tags
 	return nil
 }
+
+// Validate reports whether x satisfies the schema.
 func (x *Person) Validate() error {
 	if x.Address != nil {
 		if err := x.Address.Validate(); err != nil {
@@ -87,11 +91,13 @@ func (x *Person) Validate() error {
 	return nil
 }
 
+// Address is generated from its JSON Schema.
 type Address struct {
 	Street string  `json:"street"`
 	Zip    *string `json:"zip,omitempty"`
 }
 
+// UnmarshalJSON decodes data into Address, enforcing required properties.
 func (x *Address) UnmarshalJSON(data []byte) error {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -114,6 +120,8 @@ func (x *Address) UnmarshalJSON(data []byte) error {
 	x.Zip = sh.Zip
 	return nil
 }
+
+// Validate reports whether x satisfies the schema.
 func (x *Address) Validate() error {
 	if x.Zip != nil {
 		if !pattern0.MatchString(*x.Zip) {
@@ -123,14 +131,17 @@ func (x *Address) Validate() error {
 	return nil
 }
 
+// PersonRole is generated from its JSON Schema.
 type PersonRole string
 
+// The permitted PersonRole values.
 const (
 	PersonRoleAdmin PersonRole = "admin"
 	PersonRoleUser  PersonRole = "user"
 	PersonRoleGuest PersonRole = "guest"
 )
 
+// Validate reports whether x is one of the permitted PersonRole values.
 func (x PersonRole) Validate() error {
 	switch x {
 	case PersonRoleAdmin, PersonRoleUser, PersonRoleGuest:

@@ -86,7 +86,10 @@ document can validate itself against its `$schema`.
 
 Each example below is the generated output of `jsonschema-gen` (lightly trimmed —
 repeated `UnmarshalJSON` boilerplate is elided where a prior example already
-shows it). Wire the generator into your build with `go:generate`:
+shows it, along with the godoc comment on each declaration). Every generated
+type, method, and constant carries a godoc comment — the schema's `description`
+(or `title`) when present, a sensible default otherwise — so `go doc` and
+pkg.go.dev render usefully. Wire the generator into your build with `go:generate`:
 
 ```go
 //go:generate jsonschema-gen -package user -root User -o user.gen.go user.schema.json
