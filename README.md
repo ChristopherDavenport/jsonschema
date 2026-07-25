@@ -595,10 +595,21 @@ validator as generated code. For those there are two modes:
   ```
 
   It lists only what is actually unenforced: a schema whose discriminator `if` is
-  mirrored but that also uses `not` gets a `NOTE` naming `not` alone.
+  mirrored but that also uses `not` gets a `NOTE` naming `not` alone. The last
+  line also says whether `-engine-fallback` would *resolve* the item — it cannot
+  when the keyword constrains a property the Go type does not declare, since the
+  delegating `Validate` sees only the marshaled value:
+
+  ```go
+  // -engine-fallback cannot enforce "not" here: it validates the marshaled value
+  // of this type, which never carries "ghost". Validate the original document
+  // with the jsonschema engine instead.
+  ```
 - **`-engine-fallback`:** `Validate` for such a type delegates to the embedded
-  schema evaluated by the runtime engine — full conformance, at the cost of a
-  dependency on the `jsonschema` package and a marshal round-trip.
+  schema evaluated by the runtime engine — engine-grade conformance, at the cost
+  of a dependency on the `jsonschema` package and a marshal round-trip. Where the
+  round trip cannot carry what the keyword constrains, the delegating `Validate`
+  carries a `NOTE` saying so instead of claiming conformance it cannot deliver.
 
 The generator never half-mirrors a keyword: a schema that falls outside a
 recognized shape gets the `NOTE`, not a `Validate` that quietly skips part of it.

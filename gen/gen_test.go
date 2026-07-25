@@ -163,6 +163,82 @@ func TestConservativeShapes(t *testing.T) {
 	}
 }
 
+// TestNoteSaysWhetherFallbackHelps pins that the NOTE distinguishes keywords
+// -engine-fallback would enforce from those it cannot, because they constrain a
+// property the Go type does not declare and so cannot survive the marshal round
+// trip the delegating Validate performs.
+func TestNoteSaysWhetherFallbackHelps(t *testing.T) {
+	const overDeclared = `{"type":"object","properties":{"a":{"type":"string"}},"not":{"required":["a"]}}`
+	const overUndeclared = `{"type":"object","properties":{"a":{"type":"string"}},"not":{"required":["ghost"]}}`
+	const mixed = `{"type":"object","properties":{"kind":{"type":"string"},"value":{"type":"string"}},` +
+		`"dependentSchemas":{"kind":{"required":["value"]}},"not":{"required":["ghost"]}}`
+
+	cases := []struct {
+		name     string
+		schema   string
+		fallback bool
+		want     []string
+		notWant  []string
+	}{{
+		name:    "fallback resolves it",
+		schema:  overDeclared,
+		want:    []string{"Regenerate with -engine-fallback"},
+		notWant: []string{"cannot enforce"},
+	}, {
+		name:    "fallback cannot resolve it",
+		schema:  overUndeclared,
+		want:    []string{`cannot enforce "not"`, `"ghost"`, "original document"},
+		notWant: []string{"Regenerate with -engine-fallback, or validate"},
+	}, {
+		name:   "one of each",
+		schema: mixed,
+		want: []string{
+			`-engine-fallback to enforce "dependentSchemas"`,
+			`It cannot enforce "not"`,
+		},
+	}, {
+		// Even with the flag on, the delegating Validate must admit what the
+		// round trip loses rather than claim full conformance.
+		name:     "delegating Validate admits the gap",
+		schema:   overUndeclared,
+		fallback: true,
+		want:     []string{"delegating to the", `NOTE: "not" is not enforced faithfully even here`, `"ghost"`},
+	}, {
+		name:     "delegating Validate is clean when faithful",
+		schema:   overDeclared,
+		fallback: true,
+		want:     []string{"delegating to the"},
+		notWant:  []string{"NOTE:"},
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(Config{Package: "p", RootName: "Root", EngineFallback: tc.fallback}, []byte(tc.schema))
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			// Comment prose is wrapped, so assert against the reflowed text.
+			flowed := flowComments(string(out))
+			for _, want := range tc.want {
+				if !strings.Contains(flowed, want) {
+					t.Errorf("missing %q in:\n%s", want, out)
+				}
+			}
+			for _, no := range tc.notWant {
+				if strings.Contains(flowed, no) {
+					t.Errorf("unexpected %q in:\n%s", no, out)
+				}
+			}
+		})
+	}
+}
+
+// flowComments strips comment markers and collapses whitespace, so a test can
+// match a sentence without caring where the generator wrapped it.
+func flowComments(src string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(src, "//", " ")), " ")
+}
+
 // runInModule generates code, drops it into a temp module, and runs its tests.
 func runInModule(t *testing.T, schema string, cfg Config, testSrc string) {
 	t.Helper()

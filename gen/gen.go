@@ -63,5 +63,6 @@ func Generate(cfg Config, data []byte) ([]byte, error) {
 		docBytes:    data,
 		hasValidate: map[string]bool{},
 		isInterface: map[string]bool{},
+		declByName:  map[string]*gotype.Decl{},
 	}).emit()
 }

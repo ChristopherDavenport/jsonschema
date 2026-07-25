@@ -175,7 +175,7 @@ type (`RootRec` for `properties.rec`) which does the embedding.
 
 "Falls to the default `NOTE` / engine fallback" means: if the parent schema is
 object-shaped it keeps its own fields and gets the usual struct treatment
-([§5.1](#51-default-honest-gap-plus-a-note) / [§5.2](#52--engine-fallback-complete-conformance-for-struct-types));
+([§5.1](#51-default-honest-gap-plus-a-note) / [§5.2](#52--engine-fallback-engine-conformance-for-struct-types));
 if it is not (e.g. `allOf` of two string schemas), it becomes `type Root any`
 carrying a `NOTE` and no `Validate` — see [§5.3](#53-what-the-fallback-does-not-cover).
 
@@ -348,9 +348,38 @@ The list is per keyword, so a schema using two of them says so:
 //   - dependentSchemas ("kind", "size")
 ```
 
+**The tail says whether `-engine-fallback` would actually fix it.** That matters
+because the fallback validates the *marshaled* value of the type: a keyword
+constraining a property the type does not declare cannot be enforced by it either
+— such a property is always absent from that JSON, so the check would always pass
+or always fail rather than mirror the schema. The three tails:
+
+```go
+// every listed keyword constrains declared properties → the flag is the answer
+// Regenerate with -engine-fallback, or validate with the jsonschema engine.
+
+// none of them do → the flag would not help, and could reject valid documents
+// NOTE: it does not enforce:
+//   - not
+//
+// -engine-fallback cannot enforce "not" here: it validates the marshaled value
+// of this type, which never carries "ghost". Validate the original document
+// with the jsonschema engine instead.
+
+// one of each → the split is spelled out
+// NOTE: it does not enforce:
+//   - not
+//   - dependentSchemas ("kind")
+//
+// Regenerate with -engine-fallback to enforce "dependentSchemas". It cannot
+// enforce "not", which constrains "ghost": that is absent from the marshaled
+// value of this type, so validate the original document with the jsonschema
+// engine.
+```
+
 A declaration that has no mirrored `Validate` to carry the warning — an alias, an
-enum, a `oneOf`/`anyOf` interface — gets it on the type instead, with the tail
-adjusted because the flag cannot help there:
+enum, a `oneOf`/`anyOf` interface — gets it on the type instead, and there the
+flag is never the answer, whatever the keywords are:
 
 ```go
 // Root is generated from its JSON Schema.
@@ -358,8 +387,9 @@ adjusted because the flag cannot help there:
 // NOTE: nothing generated for this type enforces:
 //   - allOf: member 2 is an object schema with no declared properties (a dictionary)
 //
-// -engine-fallback does not cover a non-struct type, so validate values of
-// this type with the jsonschema engine.
+// -engine-fallback cannot enforce these: it rewrites Validate methods, and
+// this type has none. Validate values of this type against the schema with
+// the jsonschema engine.
 type Root any
 ```
 
@@ -383,11 +413,15 @@ func (x *Root) Validate() error {
 The messages come from `emitter.unenforced`, which is also what `needsFallback`
 is defined in terms of — so a keyword can never be silently skipped without
 appearing in the list, and the `if`/`then`/`else` diagnosis (`ifBlocker`) is the
-same function that decides whether to mirror it.
+same function that decides whether to mirror it. Whether the fallback can help is
+`unenforcedItem.engineCanEnforce`: it compares the property names the keyword
+constrains (following `required`, `properties`, and the dependent keywords through
+in-place applicators only) against the names the type can hold, including those
+promoted from embedded `allOf` parts.
 
 Output in this mode depends only on the standard library and `xvalid`.
 
-### 5.2 `-engine-fallback`: complete conformance for struct types
+### 5.2 `-engine-fallback`: engine conformance for struct types
 
 `Validate` becomes a delegating call, and one shared helper block is emitted
 per file:
@@ -445,6 +479,26 @@ Facts about this mode:
   into one document before generating ([recipe R6](#r6-bundle-remote-refs-before-generating)).
 - **Cost:** a dependency on the `jsonschema` package, the schema text in your
   binary, and a marshal + decode round trip per `Validate` call.
+- **It says so when delegation is still not faithful.** Delegation is exact only
+  for keywords constraining properties the type declares. When one does not, the
+  delegating `Validate` carries its own `NOTE` rather than claiming conformance
+  it cannot deliver:
+
+  ```go
+  // Validate reports whether x satisfies the schema, delegating to the
+  // embedded schema and runtime engine for full conformance.
+  //
+  // NOTE: "not" is not enforced faithfully even here: the engine sees the
+  // marshaled value of this type, which never carries "ghost". Validate the
+  // original document with the jsonschema engine.
+  func (x *Root) Validate() error {
+  	return validateAgainstSchema("https://example.com/s.json#", x)
+  }
+  ```
+
+  The mechanics of why are in
+  [§6.2](#62--engine-fallback-validates-the-go-value-not-the-document); the point
+  here is that you are told, at the call site, instead of having to know.
 
 ### 5.3 What the fallback does *not* cover
 
@@ -541,7 +595,11 @@ input {"a":"x","ghost":1}  →  marshals to {"a":"x"}  →  Validate() == nil
 ```
 
 The document violates `not`, and `Validate` says it is fine. This is a **false
-accept**.
+accept** — and the generated code says so, because `"ghost"` is not a declared
+property of the type ([§5.2](#52--engine-fallback-engine-conformance-for-struct-types)).
+The same mechanism produces **false rejects**: a `then: {"required": ["value"]}`
+naming an undeclared `value` makes the engine see it as permanently absent, so
+every document fails the branch.
 
 **`omitempty` erases empty-but-present values.** Every optional field is tagged
 `omitempty`, so an empty slice or map marshals away:
@@ -578,6 +636,12 @@ Rule of thumb: `-engine-fallback` is exact when the Go type is a faithful
 representation of the document — every property declared, no free-form extras,
 no ambiguous embedding. When it isn't, validate the raw bytes instead
 ([recipe R4](#r4-gate-the-boundary-with-the-engine-on-raw-bytes)).
+
+Of the three causes above, the generator detects the first statically — an
+unenforced keyword naming a property the type does not declare — and says so in
+the `NOTE`, in both modes. The other two (an `omitempty`-erased empty slice, an
+ambiguous embedded field) depend on the *value* rather than the schema, so no
+comment can flag them; they are why the rule of thumb still matters.
 
 ## 7. Recipes
 
