@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/dave/jennifer/jen"
 
@@ -22,8 +23,10 @@ type emitter struct {
 	docBytes    []byte
 	hasValidate map[string]bool
 	isInterface map[string]bool
+	declByName  map[string]*gotype.Decl
 	patterns    []patternVar
 	needEngine  bool // an engine-fallback helper block must be emitted
+	report      Report
 }
 
 const enginePkg = "github.com/ChristopherDavenport/jsonschema"
@@ -37,20 +40,189 @@ func (e *emitter) hybrid(d *gotype.Decl) bool {
 // needsFallback reports whether a declaration uses keywords that are neither
 // mirrored inline nor handled idiomatically (allOf embedding, discriminator if).
 func (e *emitter) needsFallback(d *gotype.Decl) bool {
+	return len(e.unenforced(d)) > 0
+}
+
+// unenforcedItem is one keyword a declaration uses that generated code does not
+// enforce, together with whether -engine-fallback would actually fix it.
+type unenforcedItem struct {
+	keyword string   // "not", "dependentSchemas", "if/then/else", "allOf"
+	detail  string   // the full line: keyword plus which rule it missed
+	unseen  []string // properties it constrains that this type does not declare
+}
+
+// engineCanEnforce reports whether a delegating Validate would enforce this item
+// faithfully. It cannot when the keyword constrains properties the Go type does
+// not declare: the fallback validates the marshaled value, where such a property
+// is always absent — so the check either always passes or always fails.
+func (u unenforcedItem) engineCanEnforce() bool { return len(u.unseen) == 0 }
+
+// unenforced lists the keywords this declaration uses that generated code does
+// not enforce, naming for each the rule it missed and whether the engine
+// fallback covers it. An empty result means everything is mirrored.
+func (e *emitter) unenforced(d *gotype.Decl) []unenforcedItem {
 	s := d.Schema
 	if s == nil {
-		return false
+		return nil
 	}
-	if s.Not != nil || len(s.DependentSchemas) > 0 {
-		return true
+	declared := e.declaredJSON(d)
+	var out []unenforcedItem
+	add := func(keyword, detail string, constrains ...*ir.Schema) {
+		out = append(out, unenforcedItem{
+			keyword: keyword,
+			detail:  detail,
+			unseen:  undeclaredProps(declared, constrains...),
+		})
 	}
-	if (s.If != nil || s.Then != nil || s.Else != nil) && !e.ifHandled(d) {
-		return true
+
+	if s.Not != nil {
+		add("not", "not", s.Not)
+	}
+	if len(s.DependentSchemas) > 0 {
+		triggers := sortedStrings(keysOf(s.DependentSchemas))
+		item := unenforcedItem{
+			keyword: "dependentSchemas",
+			detail:  "dependentSchemas (" + quoteList(triggers) + ")",
+		}
+		// A trigger property the type does not declare can never look present.
+		for _, t := range triggers {
+			if !declared[t] {
+				item.unseen = append(item.unseen, t)
+			}
+		}
+		deps := make([]*ir.Schema, 0, len(s.DependentSchemas))
+		for _, t := range triggers {
+			deps = append(deps, s.DependentSchemas[t])
+		}
+		item.unseen = mergeSorted(item.unseen, undeclaredProps(declared, deps...))
+		out = append(out, item)
+	}
+	if s.If != nil || s.Then != nil || s.Else != nil {
+		if why := e.ifBlocker(d); why != "" {
+			add("if/then/else", "if/then/else: "+why, s.If, s.Then, s.Else)
+		}
 	}
 	if len(s.AllOf) > 0 && !d.AllOfHandled {
-		return true
+		why := d.AllOfBlocked
+		if why == "" {
+			why = "members cannot be expressed as struct embedding"
+		}
+		add("allOf", "allOf: "+why, s.AllOf...)
 	}
-	return false
+	return out
+}
+
+// collectUnenforced adds this declaration's unenforced keywords to the report,
+// with the remedy that applies to it. It deliberately mirrors what the NOTE
+// comments say: an item the delegating Validate does enforce is not reported.
+func (e *emitter) collectUnenforced(d *gotype.Decl) {
+	items := e.unenforced(d)
+	if len(items) == 0 {
+		return
+	}
+	hasValidate := e.hasValidate[d.Name]
+	delegates := e.hybrid(d)
+
+	tr := TypeReport{Type: d.Name, HasValidate: hasValidate, Delegates: delegates}
+	for _, it := range items {
+		u := Unenforced{Keyword: it.keyword, Detail: it.detail}
+		switch {
+		case d.Kind != gotype.Struct:
+			u.Why = "it rewrites Validate methods, and this type has none"
+		case !it.engineCanEnforce():
+			// Properties are named only here: they are what the round trip loses.
+			u.Properties = it.unseen
+			u.Why = "it validates the marshaled value of this type, which never carries the properties this keyword constrains"
+		case delegates:
+			continue // the delegating Validate already enforces this one
+		default:
+			u.FallbackWouldEnforce = true
+		}
+		tr.Items = append(tr.Items, u)
+	}
+	if len(tr.Items) > 0 {
+		e.report.Types = append(e.report.Types, tr)
+	}
+}
+
+// declaredJSON is the set of JSON property names this type can hold: its own
+// fields plus those promoted from embedded allOf parts. A name outside this set
+// does not survive a marshal round trip, so the engine fallback cannot see it.
+func (e *emitter) declaredJSON(d *gotype.Decl) map[string]bool {
+	declared := map[string]bool{}
+	var walk func(*gotype.Decl, int)
+	walk = func(d *gotype.Decl, depth int) {
+		if d == nil || depth > 8 {
+			return
+		}
+		for _, f := range d.Fields {
+			declared[f.JSONName] = true
+		}
+		for _, emb := range d.Embeds {
+			walk(e.declByName[emb.Named], depth+1)
+		}
+	}
+	walk(d, 0)
+	return declared
+}
+
+// undeclaredProps collects the property names the given subschemas constrain on
+// *this* instance — via required, properties, and the dependent keywords — that
+// are not in the declared set. It descends only through in-place applicators,
+// which apply to the same instance; a property subschema constrains a child
+// value, whose own properties belong to a different Go type.
+func undeclaredProps(declared map[string]bool, schemas ...*ir.Schema) []string {
+	seen := map[string]bool{}
+	var walk func(*ir.Schema, int)
+	walk = func(s *ir.Schema, depth int) {
+		if s == nil || s.IsBoolean() || depth > 8 {
+			return
+		}
+		names := append([]string{}, s.Required...)
+		names = append(names, keysOf(s.Properties)...)
+		names = append(names, keysOf(s.DependentRequired)...)
+		names = append(names, keysOf(s.DependentSchemas)...)
+		for _, n := range names {
+			if !declared[n] {
+				seen[n] = true
+			}
+		}
+		for _, in := range append(append([]*ir.Schema{}, s.AllOf...), append(s.AnyOf, s.OneOf...)...) {
+			walk(in, depth+1)
+		}
+		walk(s.Not, depth+1)
+		walk(s.If, depth+1)
+		walk(s.Then, depth+1)
+		walk(s.Else, depth+1)
+		for _, dep := range s.DependentSchemas {
+			walk(dep, depth+1)
+		}
+	}
+	for _, s := range schemas {
+		walk(s, 0)
+	}
+	return sortedStrings(keysOf(seen))
+}
+
+// mergeSorted unions two name lists.
+func mergeSorted(a, b []string) []string {
+	set := map[string]bool{}
+	for _, s := range append(a, b...) {
+		set[s] = true
+	}
+	return sortedStrings(keysOf(set))
+}
+
+// quoteList renders names as a comma-separated list of quoted strings.
+func quoteList(names []string) string {
+	var b bytes.Buffer
+	for i, n := range names {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%q", n)
+	}
+	return b.String()
 }
 
 type patternVar struct {
@@ -64,12 +236,19 @@ func (e *emitter) emit() ([]byte, error) {
 
 	// Classify declarations: which have Validate methods, which are interfaces.
 	for _, d := range e.model.Decls {
+		e.declByName[d.Name] = d
 		if d.Kind == gotype.Struct || d.Kind == gotype.Enum {
 			e.hasValidate[d.Name] = true
 		}
 		if d.Kind == gotype.Interface {
 			e.isInterface[d.Name] = true
 		}
+	}
+
+	// Record what the output will not enforce, in declaration order, so callers
+	// can report the same thing the NOTE comments say.
+	for _, d := range e.model.Decls {
+		e.collectUnenforced(d)
 	}
 
 	for _, d := range e.model.Decls {
@@ -285,6 +464,99 @@ func typeDoc(name, desc string) string {
 	return name + " is generated from its JSON Schema."
 }
 
+// emitTypeDoc writes a declaration's godoc comment. For a type that is not a
+// struct — an alias, enum or union interface — there is no mirrored Validate to
+// carry the NOTE, and the engine fallback cannot delegate either, so the warning
+// about unenforced keywords goes on the type itself.
+func (e *emitter) emitTypeDoc(f *jen.File, d *gotype.Decl, extra string) {
+	f.Comment(typeDoc(d.Name, d.Doc) + extra)
+	items := e.unenforced(d)
+	if len(items) == 0 {
+		return
+	}
+	f.Comment("")
+	f.Comment("NOTE: nothing generated for this type enforces:")
+	for _, it := range items {
+		f.Comment("  - " + it.detail)
+	}
+	f.Comment("")
+	// The fallback rewrites Validate methods, and this type has none, so the
+	// flag is never the answer here whatever the keywords are.
+	f.Comment("-engine-fallback cannot enforce these: it rewrites Validate methods, and")
+	f.Comment("this type has none. Validate values of this type against the schema with")
+	f.Comment("the jsonschema engine.")
+}
+
+// remedyLines is the tail of a struct's NOTE: what the reader should do. It
+// distinguishes the keywords -engine-fallback would enforce from those it could
+// not, because the fallback validates the marshaled Go value and a property this
+// type does not declare is always absent from it — so such a check would always
+// pass, or always fail, rather than mirror the schema.
+func remedyLines(items []unenforcedItem) []string {
+	var fixable, stuck []string
+	var unseen []string
+	for _, it := range items {
+		if it.engineCanEnforce() {
+			fixable = append(fixable, it.keyword)
+			continue
+		}
+		stuck = append(stuck, it.keyword)
+		unseen = mergeSorted(unseen, it.unseen)
+	}
+
+	switch {
+	case len(stuck) == 0:
+		return wrapComment("Regenerate with -engine-fallback, or validate with the jsonschema engine.")
+	case len(fixable) == 0:
+		return wrapComment("-engine-fallback cannot enforce " + joinList(stuck) + " here: it validates the marshaled value of this type, which never carries " +
+			quoteList(unseen) + ". Validate the original document with the jsonschema engine instead.")
+	default:
+		return wrapComment("Regenerate with -engine-fallback to enforce " + joinList(fixable) +
+			". It cannot enforce " + joinList(stuck) + ", which constrains " + quoteList(unseen) +
+			": that is absent from the marshaled value of this type, so validate the original document with the jsonschema engine.")
+	}
+}
+
+// joinList renders quoted keywords as `"a"`, `"a" and "b"`, or `"a", "b" and
+// "c"`. Quoting keeps a bare `not` from reading as English negation.
+func joinList(ss []string) string {
+	quoted := make([]string, len(ss))
+	for i, s := range ss {
+		quoted[i] = fmt.Sprintf("%q", s)
+	}
+	switch len(quoted) {
+	case 0:
+		return ""
+	case 1:
+		return quoted[0]
+	case 2:
+		return quoted[0] + " and " + quoted[1]
+	}
+	return strings.Join(quoted[:len(quoted)-1], ", ") + " and " + quoted[len(quoted)-1]
+}
+
+// wrapComment breaks text into comment-width lines on word boundaries.
+func wrapComment(text string) []string {
+	const width = 74
+	var lines []string
+	line := ""
+	for _, w := range strings.Fields(text) {
+		switch {
+		case line == "":
+			line = w
+		case len(line)+1+len(w) <= width:
+			line += " " + w
+		default:
+			lines = append(lines, line)
+			line = w
+		}
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	return lines
+}
+
 func keysOf[V any](m map[string]V) []string {
 	ks := make([]string, 0, len(m))
 	for k := range m {
@@ -338,13 +610,19 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 	body = append(body, jen.Return(jen.Nil()))
 
 	// Warn when the schema uses keywords the generator does not enforce (and
-	// the engine fallback was not requested).
-	if e.needsFallback(d) {
+	// the engine fallback was not requested), naming each one and saying which
+	// of them regenerating with -engine-fallback would actually fix.
+	if items := e.unenforced(d); len(items) > 0 {
 		f.Comment("Validate reports whether x satisfies the constraints this type mirrors inline.")
 		f.Comment("")
-		f.Comment("NOTE: this schema uses not, dependentSchemas, or a non-discriminator")
-		f.Comment("if/then/else that generated Validate does not enforce. Regenerate")
-		f.Comment("with -engine-fallback, or validate with the jsonschema engine.")
+		f.Comment("NOTE: it does not enforce:")
+		for _, it := range items {
+			f.Comment("  - " + it.detail)
+		}
+		f.Comment("")
+		for _, line := range remedyLines(items) {
+			f.Comment(line)
+		}
 	} else {
 		f.Comment("Validate reports whether x satisfies the schema.")
 	}
@@ -353,45 +631,107 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 
 // ifHandled reports whether a struct's if/then/else is a string-discriminator
 // with required-only then/else branches — the subset we mirror idiomatically.
+// It is defined as "ifBlocker found nothing", so the decision to mirror and the
+// explanation emitted when we don't can never disagree.
 func (e *emitter) ifHandled(d *gotype.Decl) bool {
-	s := d.Schema
-	if s.If == nil {
-		return false
-	}
-	if !isStringDiscriminator(s.If) {
-		return false
-	}
-	if s.Then != nil && !isRequiredOnly(s.Then) {
-		return false
-	}
-	if s.Else != nil && !isRequiredOnly(s.Else) {
-		return false
-	}
-	byJSON := fieldsByJSON(d)
-	for name := range s.If.Properties {
-		f, ok := byJSON[name]
-		if !ok || !isStringField(f) {
-			return false
-		}
-	}
-	return true
+	return e.ifBlocker(d) == ""
 }
 
-// isStringDiscriminator reports whether sch is `{properties: {P: const/enum
-// string, ...}}` and nothing else — a tag check on one or more string fields.
-func isStringDiscriminator(sch *ir.Schema) bool {
-	if sch.IsBoolean() || len(sch.Properties) == 0 {
-		return false
+// ifBlocker names the first recognition rule a struct's if/then/else fails, in
+// schema terms, or "" when the whole shape is mirrored inline. The rules: the
+// `if` constrains nothing but `properties`; every one of those properties is a
+// plain string const/enum match against a plain Go string field; and `then`/
+// `else` constrain nothing but a non-empty `required` over declared properties.
+func (e *emitter) ifBlocker(d *gotype.Decl) string {
+	s := d.Schema
+	switch {
+	case s.If == nil:
+		return "then/else with no if"
+	case s.If.IsBoolean():
+		return "if is a boolean schema"
+	case len(s.If.Properties) == 0:
+		return "if does not constrain any property"
+	case s.If.Ref != "" || s.If.Not != nil || s.If.If != nil ||
+		len(s.If.AllOf) > 0 || len(s.If.AnyOf) > 0 || len(s.If.OneOf) > 0 ||
+		len(s.If.Required) > 0 || !s.If.Type.Empty():
+		return "if constrains more than properties"
 	}
-	if sch.Ref != "" || sch.Not != nil || sch.If != nil ||
-		len(sch.AllOf) > 0 || len(sch.AnyOf) > 0 || len(sch.OneOf) > 0 ||
-		len(sch.Required) > 0 || !sch.Type.Empty() {
-		return false
-	}
-	for _, ps := range sch.Properties {
-		if stringDiscriminatorValues(ps) == nil {
-			return false
+
+	byJSON := fieldsByJSON(d)
+	for _, name := range sortedStrings(keysOf(s.If.Properties)) {
+		if !isSimpleStringMatch(s.If.Properties[name]) {
+			return fmt.Sprintf("if property %q is not a plain string const/enum match", name)
 		}
+		f, ok := byJSON[name]
+		if !ok {
+			return fmt.Sprintf("if property %q is not a declared property", name)
+		}
+		if !isStringField(f) {
+			return fmt.Sprintf("if property %q is not a plain Go string field", name)
+		}
+	}
+
+	for _, branch := range []struct {
+		kw  string
+		sch *ir.Schema
+	}{{"then", s.Then}, {"else", s.Else}} {
+		if branch.sch == nil {
+			continue
+		}
+		if !isRequiredOnly(branch.sch) {
+			return branch.kw + " constrains more than a non-empty required"
+		}
+		// A required name with no field could not be checked at all, and
+		// pretending otherwise would emit a Validate that silently ignores it.
+		for _, name := range branch.sch.Required {
+			if _, ok := byJSON[name]; !ok {
+				return fmt.Sprintf("%s requires %q, which is not a declared property", branch.kw, name)
+			}
+		}
+	}
+	return ""
+}
+
+// isSimpleStringMatch reports whether ps matches a string value and nothing
+// else: a string `const` or an all-string `enum`, optionally restating `"type":
+// "string"`. Any further assertion on the tag would have to be mirrored too, so
+// it disqualifies the discriminator shape rather than being dropped.
+func isSimpleStringMatch(ps *ir.Schema) bool {
+	if ps.IsBoolean() || stringDiscriminatorValues(ps) == nil {
+		return false
+	}
+	if ps.Const != nil && len(ps.Enum) > 0 {
+		return false // both apply; only const would be mirrored
+	}
+	// `type` may only restate that the value is a string.
+	if !ps.Type.Empty() && (len(ps.Type) != 1 || !ps.Type.Contains(ir.TypeString)) {
+		return false
+	}
+	return !hasOtherAssertions(ps)
+}
+
+// hasOtherAssertions reports whether s carries any assertion or applicator
+// beyond `type`, `const` and `enum`. Pure annotations (title, description,
+// default, examples, deprecated, $comment) are ignored: they never constrain.
+func hasOtherAssertions(s *ir.Schema) bool {
+	switch {
+	case s.Ref != "" || s.DynamicRef != "":
+	case len(s.AllOf) > 0 || len(s.AnyOf) > 0 || len(s.OneOf) > 0 || s.Not != nil:
+	case s.If != nil || s.Then != nil || s.Else != nil || len(s.DependentSchemas) > 0:
+	case len(s.Properties) > 0 || len(s.PatternProperties) > 0 ||
+		s.AdditionalProperties != nil || s.PropertyNames != nil || s.UnevaluatedProperties != nil:
+	case len(s.PrefixItems) > 0 || s.Items != nil || s.Contains != nil || s.UnevaluatedItems != nil:
+	case s.MultipleOf != nil || s.Maximum != nil || s.ExclusiveMaximum != nil ||
+		s.Minimum != nil || s.ExclusiveMinimum != nil:
+	case s.MaxLength != nil || s.MinLength != nil || s.Pattern != "":
+	case s.MaxItems != nil || s.MinItems != nil || s.UniqueItems ||
+		s.MaxContains != nil || s.MinContains != nil:
+	case s.MaxProperties != nil || s.MinProperties != nil ||
+		len(s.Required) > 0 || len(s.DependentRequired) > 0:
+	case s.Format != "":
+	case s.ContentEncoding != "" || s.ContentMediaType != "" || s.ContentSchema != nil:
+	default:
+		return false
 	}
 	return true
 }
@@ -512,10 +852,34 @@ func requiredPresenceChecks(byJSON map[string]*gotype.Field, sch *ir.Schema) []j
 
 // emitDelegatingValidate emits a Validate that defers to the runtime engine,
 // validating the marshaled value against this type's subschema by location.
+// Delegation is faithful only for keywords that constrain properties this type
+// declares, so any that do not are called out here too.
 func (e *emitter) emitDelegatingValidate(f *jen.File, d *gotype.Decl) {
 	e.needEngine = true
+
+	var stuck []string
+	var unseen []string
+	for _, it := range e.unenforced(d) {
+		if !it.engineCanEnforce() {
+			stuck = append(stuck, it.keyword)
+			unseen = mergeSorted(unseen, it.unseen)
+		}
+	}
+
 	f.Comment("Validate reports whether x satisfies the schema, delegating to the")
 	f.Comment("embedded schema and runtime engine for full conformance.")
+	if len(stuck) > 0 {
+		verb := "is"
+		if len(stuck) > 1 {
+			verb = "are"
+		}
+		f.Comment("")
+		for _, line := range wrapComment("NOTE: " + joinList(stuck) + " " + verb +
+			" not enforced faithfully even here: the engine sees the marshaled value of this type, which never carries " +
+			quoteList(unseen) + ". Validate the original document with the jsonschema engine.") {
+			f.Comment(line)
+		}
+	}
 	f.Func().Params(jen.Id("x").Op("*").Id(d.Name)).Id("Validate").Params().Error().Block(
 		jen.Return(jen.Id("validateAgainstSchema").Call(jen.Lit(d.Schema.Location), jen.Id("x"))),
 	)
@@ -731,7 +1095,7 @@ func fieldNumKind(fld *gotype.Field) string {
 }
 
 func (e *emitter) emitEnum(f *jen.File, d *gotype.Decl) {
-	f.Comment(typeDoc(d.Name, d.Doc))
+	e.emitTypeDoc(f, d, "")
 	f.Type().Id(d.Name).Add(e.typeCode(d.Underlying))
 	defs := make([]jen.Code, 0, len(d.Enum))
 	cases := make([]jen.Code, 0, len(d.Enum))
@@ -751,7 +1115,7 @@ func (e *emitter) emitEnum(f *jen.File, d *gotype.Decl) {
 }
 
 func (e *emitter) emitAlias(f *jen.File, d *gotype.Decl) {
-	f.Comment(typeDoc(d.Name, d.Doc))
+	e.emitTypeDoc(f, d, "")
 	f.Type().Id(d.Name).Add(e.typeCode(d.Underlying))
 }
 
@@ -759,7 +1123,7 @@ func (e *emitter) emitAlias(f *jen.File, d *gotype.Decl) {
 // method on each variant, and an Unmarshal<Name> dispatcher.
 func (e *emitter) emitInterface(f *jen.File, d *gotype.Decl) {
 	marker := "is" + d.Name
-	f.Comment(typeDoc(d.Name, d.Doc) + " It is a closed union implemented by its variant types.")
+	e.emitTypeDoc(f, d, " It is a closed union implemented by its variant types.")
 	f.Type().Id(d.Name).Interface(jen.Id(marker).Params())
 
 	for _, v := range d.Variants {

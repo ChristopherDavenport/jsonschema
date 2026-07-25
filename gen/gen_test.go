@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -105,6 +106,202 @@ func TestGeneratedEngineFallback(t *testing.T) {
 // part's required fields and Validate enforced.
 func TestGeneratedAllOf(t *testing.T) {
 	runInModule(t, allOfSchema, Config{Package: "gentest", RootName: "Record"}, allOfTest)
+}
+
+// TestConservativeShapes pins the shapes that look like an inline path but are
+// deliberately refused, so they surface as a NOTE instead of a Validate that
+// quietly ignores part of the schema.
+func TestConservativeShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		absent  string // generated source must not contain this
+		note    string // the NOTE must name this exact condition
+		comment string
+	}{{
+		name:    "then requires an undeclared property",
+		schema:  `{"type":"object","properties":{"kind":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret"}}},"then":{"required":["value"]}}`,
+		absent:  `*x.Kind == "secret"`,
+		note:    `then requires "value", which is not a declared property`,
+		comment: "no field backs `value`, so the requirement is uncheckable inline",
+	}, {
+		name:    "tag property carries an extra assertion",
+		schema:  `{"type":"object","properties":{"kind":{"type":"string"},"value":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret","minLength":99}}},"then":{"required":["value"]}}`,
+		absent:  `*x.Kind == "secret"`,
+		note:    `if property "kind" is not a plain string const/enum match`,
+		comment: "minLength inside the if would be dropped by a plain tag comparison",
+	}, {
+		name:    "allOf member is a dictionary, not a struct",
+		schema:  `{"allOf":[{"$ref":"#/$defs/a"},{"$ref":"#/$defs/dict"}],"$defs":{"a":{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}},"dict":{"type":"object","additionalProperties":{"type":"string"}}}}`,
+		absent:  "\tDict\n",
+		note:    "allOf: member 2 is an object schema with no declared properties",
+		comment: "embedding a named map type would marshal as {\"Dict\":{…}}",
+	}, {
+		// The if/then here IS mirrored; only `not` is not. The NOTE must say so
+		// rather than implicating the whole family.
+		name:    "only the unenforced keyword is named",
+		schema:  `{"type":"object","properties":{"kind":{"type":"string"},"value":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret"}}},"then":{"required":["value"]},"not":{"required":["ghost"]}}`,
+		absent:  "if/then/else",
+		note:    "  - not\n",
+		comment: "the discriminator if is enforced; only `not` is not",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(Config{Package: "p", RootName: "Root"}, []byte(tc.schema))
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			src := string(out)
+			if strings.Contains(src, tc.absent) {
+				t.Errorf("generated code contains %q (%s):\n%s", tc.absent, tc.comment, src)
+			}
+			if !strings.Contains(src, tc.note) {
+				t.Errorf("NOTE does not name the condition %q (%s):\n%s", tc.note, tc.comment, src)
+			}
+		})
+	}
+}
+
+// TestNoteSaysWhetherFallbackHelps pins that the NOTE distinguishes keywords
+// -engine-fallback would enforce from those it cannot, because they constrain a
+// property the Go type does not declare and so cannot survive the marshal round
+// trip the delegating Validate performs.
+func TestNoteSaysWhetherFallbackHelps(t *testing.T) {
+	const overDeclared = `{"type":"object","properties":{"a":{"type":"string"}},"not":{"required":["a"]}}`
+	const overUndeclared = `{"type":"object","properties":{"a":{"type":"string"}},"not":{"required":["ghost"]}}`
+	const mixed = `{"type":"object","properties":{"kind":{"type":"string"},"value":{"type":"string"}},` +
+		`"dependentSchemas":{"kind":{"required":["value"]}},"not":{"required":["ghost"]}}`
+
+	cases := []struct {
+		name     string
+		schema   string
+		fallback bool
+		want     []string
+		notWant  []string
+	}{{
+		name:    "fallback resolves it",
+		schema:  overDeclared,
+		want:    []string{"Regenerate with -engine-fallback"},
+		notWant: []string{"cannot enforce"},
+	}, {
+		name:    "fallback cannot resolve it",
+		schema:  overUndeclared,
+		want:    []string{`cannot enforce "not"`, `"ghost"`, "original document"},
+		notWant: []string{"Regenerate with -engine-fallback, or validate"},
+	}, {
+		name:   "one of each",
+		schema: mixed,
+		want: []string{
+			`-engine-fallback to enforce "dependentSchemas"`,
+			`It cannot enforce "not"`,
+		},
+	}, {
+		// Even with the flag on, the delegating Validate must admit what the
+		// round trip loses rather than claim full conformance.
+		name:     "delegating Validate admits the gap",
+		schema:   overUndeclared,
+		fallback: true,
+		want:     []string{"delegating to the", `NOTE: "not" is not enforced faithfully even here`, `"ghost"`},
+	}, {
+		name:     "delegating Validate is clean when faithful",
+		schema:   overDeclared,
+		fallback: true,
+		want:     []string{"delegating to the"},
+		notWant:  []string{"NOTE:"},
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(Config{Package: "p", RootName: "Root", EngineFallback: tc.fallback}, []byte(tc.schema))
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			// Comment prose is wrapped, so assert against the reflowed text.
+			flowed := flowComments(string(out))
+			for _, want := range tc.want {
+				if !strings.Contains(flowed, want) {
+					t.Errorf("missing %q in:\n%s", want, out)
+				}
+			}
+			for _, no := range tc.notWant {
+				if strings.Contains(flowed, no) {
+					t.Errorf("unexpected %q in:\n%s", no, out)
+				}
+			}
+		})
+	}
+}
+
+// TestReport pins the machine-readable report the CLI prints: it lists exactly
+// what the output does not enforce, and drops an item once the generated code
+// actually enforces it.
+func TestReport(t *testing.T) {
+	const schema = `{"type":"object",
+	  "properties":{"kind":{"type":"string"},"value":{"type":"string"}},
+	  "dependentSchemas":{"kind":{"required":["value"]}},
+	  "not":{"required":["ghost"]}}`
+
+	_, report, err := GenerateWithReport(Config{Package: "p", RootName: "Item"}, []byte(schema))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if report.Empty() || len(report.Types) != 1 {
+		t.Fatalf("want one reported type, got %+v", report)
+	}
+	got := report.Types[0]
+	if got.Type != "Item" || !got.HasValidate || got.Delegates {
+		t.Errorf("type report wrong: %+v", got)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("want both keywords reported, got %+v", got.Items)
+	}
+	byKeyword := map[string]Unenforced{}
+	for _, it := range got.Items {
+		byKeyword[it.Keyword] = it
+	}
+	if it := byKeyword["dependentSchemas"]; !it.FallbackWouldEnforce {
+		t.Errorf("dependentSchemas over declared properties is fixable by the flag: %+v", it)
+	}
+	if it := byKeyword["not"]; it.FallbackWouldEnforce || len(it.Properties) != 1 || it.Properties[0] != "ghost" {
+		t.Errorf(`not over an undeclared "ghost" is not fixable by the flag: %+v`, it)
+	}
+	if n := report.FallbackWouldFix(); n != 1 {
+		t.Errorf("FallbackWouldFix() = %d, want 1", n)
+	}
+	if s := report.String(); !strings.Contains(s, "Item") || !strings.Contains(s, "would enforce 1 constraint") {
+		t.Errorf("rendered report reads wrong:\n%s", s)
+	}
+
+	// With the flag on, the engine enforces dependentSchemas, so only the item
+	// the marshal round trip cannot carry is still reported.
+	_, report, err = GenerateWithReport(Config{Package: "p", RootName: "Item", EngineFallback: true}, []byte(schema))
+	if err != nil {
+		t.Fatalf("generate with fallback: %v", err)
+	}
+	if len(report.Types) != 1 || len(report.Types[0].Items) != 1 ||
+		report.Types[0].Items[0].Keyword != "not" || !report.Types[0].Delegates {
+		t.Errorf("with -engine-fallback, want only `not` reported on a delegating type: %+v", report.Types)
+	}
+	if n := report.FallbackWouldFix(); n != 0 {
+		t.Errorf("nothing left for the flag to fix, got %d", n)
+	}
+
+	// A schema the generator mirrors completely reports nothing.
+	_, report, err = GenerateWithReport(Config{Package: "p", RootName: "Clean"},
+		[]byte(`{"type":"object","required":["a"],"properties":{"a":{"type":"string","minLength":2}}}`))
+	if err != nil {
+		t.Fatalf("generate clean: %v", err)
+	}
+	if !report.Empty() || report.String() != "" {
+		t.Errorf("fully-enforced schema should report nothing, got %+v", report)
+	}
+}
+
+// flowComments strips comment markers and collapses whitespace, so a test can
+// match a sentence without caring where the generator wrapped it.
+func flowComments(src string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(src, "//", " ")), " ")
 }
 
 // runInModule generates code, drops it into a temp module, and runs its tests.

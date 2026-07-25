@@ -44,6 +44,10 @@ type Decl struct {
 	// AllOfHandled records that allOf was enforced idiomatically (via embedding),
 	// so it needs no engine fallback.
 	AllOfHandled bool
+
+	// AllOfBlocked explains, when allOf could not be embedded, which member
+	// stopped it. The generator reports this in the NOTE it emits instead.
+	AllOfBlocked string
 }
 
 // Field is one struct field.
