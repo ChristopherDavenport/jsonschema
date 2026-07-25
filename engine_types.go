@@ -5,7 +5,6 @@ import (
 	"math"
 	"math/big"
 	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/ChristopherDavenport/jsonschema/ir"
@@ -17,7 +16,7 @@ import (
 type validator struct {
 	ldr          *loader.Loader
 	assertFormat bool
-	patterns     map[string]*regexp.Regexp
+	patterns     map[string]xvalid.Regexp
 	// vocab records which vocabulary groups are asserted vs. ignored.
 	vocab vocabSet
 	// dynScope is the stack of resource base URIs currently being evaluated,
@@ -131,8 +130,9 @@ func (v *validator) err(iloc, kloc, keyword, msg string) *xvalid.Error {
 	}
 }
 
-// pattern returns a compiled (and cached) RE2 regexp for p.
-func (v *validator) pattern(p string) (*regexp.Regexp, error) {
+// pattern returns a compiled (and cached) matcher for p, from whichever regexp
+// engine is active (RE2 by default; see xvalid.UseRegexpEngine).
+func (v *validator) pattern(p string) (xvalid.Regexp, error) {
 	if re, ok := v.patterns[p]; ok {
 		return re, nil
 	}

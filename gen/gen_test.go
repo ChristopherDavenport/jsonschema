@@ -96,10 +96,25 @@ func TestGeneratedDiscriminator(t *testing.T) {
 	runInModule(t, condSchema, Config{Package: "gentest", RootName: "Item"}, condTest)
 }
 
+// TestGeneratedEnumDiscriminator proves the same if/then is enforced inline when
+// the tag is an enum, comparing against the generated constant. Writing the tag
+// as an `enum` is the most natural way to spell a tagged union; requiring the Go
+// type to be exactly `string` made it the most common surprise in the docs.
+func TestGeneratedEnumDiscriminator(t *testing.T) {
+	runInModule(t, enumCondSchema, Config{Package: "gentest", RootName: "Item"}, enumCondTest)
+}
+
 // TestGeneratedEngineFallback proves that with EngineFallback, a keyword that is
 // never mirrored inline (dependentSchemas) is enforced via the runtime engine.
 func TestGeneratedEngineFallback(t *testing.T) {
 	runInModule(t, fallbackSchema, Config{Package: "gentest", RootName: "Item", EngineFallback: true}, fallbackTest)
+}
+
+// TestGeneratedRemoteRef proves an unbundled remote $ref can be supplied at
+// runtime through the generated AddSchemaResource hook, rather than forcing the
+// caller to bundle every remote document into the input before generating.
+func TestGeneratedRemoteRef(t *testing.T) {
+	runInModule(t, remoteRefSchema, Config{Package: "gentest", RootName: "Item", EngineFallback: true}, remoteRefTest)
 }
 
 // TestGeneratedAllOf proves allOf is modeled as struct embedding with each
@@ -115,6 +130,76 @@ func TestGeneratedAllOf(t *testing.T) {
 func TestGeneratedAllOfMerge(t *testing.T) {
 	runInModule(t, mergeSchema, Config{Package: "gentest", RootName: "Record"}, mergeTest)
 }
+
+// TestGeneratedEmptyCollectionsSurvive proves an empty-but-present array or
+// object round-trips. Under `omitempty` an optional empty slice marshaled away
+// entirely, so a document that satisfied the schema on the way in failed its own
+// `required` check on the way out — a false reject no NOTE could warn about,
+// because it depends on the value rather than the schema. `omitzero` omits only
+// the zero value, so nil is dropped and empty-non-nil survives.
+func TestGeneratedEmptyCollectionsSurvive(t *testing.T) {
+	runInModule(t, emptyCollectionSchema, Config{Package: "gentest", RootName: "Item"}, emptyCollectionTest)
+}
+
+// tags is optional at the top level — so it carries the omit tag — but becomes
+// required once kind is present. That is where erasing an empty-but-present
+// value changes the answer: the document is valid going in and invalid coming
+// back out.
+const emptyCollectionSchema = `{
+  "type": "object",
+  "properties": {
+    "kind": {"type": "string"},
+    "tags": {"type": "array", "items": {"type": "string"}},
+    "note": {"type": "string"}
+  },
+  "dependentRequired": {"kind": ["tags"]}
+}`
+
+const emptyCollectionTest = `package gentest
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func TestEmptyCollectionsSurvive(t *testing.T) {
+	const doc = ` + "`" + `{"kind":"k","tags":[]}` + "`" + `
+	var x Item
+	if err := json.Unmarshal([]byte(doc), &x); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if x.Tags == nil || len(x.Tags) != 0 {
+		t.Fatalf("empty array should decode to an empty non-nil slice: %#v", x.Tags)
+	}
+	if err := x.Validate(); err != nil {
+		t.Fatalf("the document is valid as given: %v", err)
+	}
+
+	b, err := json.Marshal(x)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), ` + "`" + `"tags":[]` + "`" + `) {
+		t.Errorf("empty-but-present array did not survive marshal: %s", b)
+	}
+	// A nil optional field is still omitted — omitzero must not turn into "always".
+	if strings.Contains(string(b), "note") {
+		t.Errorf("nil optional field should be omitted: %s", b)
+	}
+
+	// The type reads back its own output and still satisfies the schema. This is
+	// the false reject: under omitempty "tags" was erased here, and the
+	// dependentRequired check then failed on a document that was always valid.
+	var back Item
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("re-unmarshal own output %s: %v", b, err)
+	}
+	if err := back.Validate(); err != nil {
+		t.Fatalf("valid document rejected after round trip (%s): %v", b, err)
+	}
+}
+`
 
 // TestConservativeShapes pins the shapes that look like an inline path but are
 // deliberately refused, so they surface as a NOTE instead of a Validate that
@@ -303,6 +388,151 @@ func TestReport(t *testing.T) {
 	}
 	if !report.Empty() || report.String() != "" {
 		t.Errorf("fully-enforced schema should report nothing, got %+v", report)
+	}
+}
+
+// TestUnmirroredKeywordsAreAnnounced pins the invariant the whole design rests
+// on: every constraint the generated code does not enforce reaches the NOTE and
+// the report, so -strict fails on it. Before this, a schema whose only constraint
+// was `minProperties: 2` generated a Validate returning nil, reported nothing,
+// and passed -strict clean — a silent false accept, the one gap that could burn
+// someone who read the docs and did everything right.
+func TestUnmirroredKeywordsAreAnnounced(t *testing.T) {
+	cases := []struct {
+		name     string
+		schema   string
+		detail   string // the NOTE and report must name this
+		fallback bool   // whether -engine-fallback would enforce it faithfully
+	}{{
+		name:   "minProperties",
+		schema: `{"type":"object","minProperties":2,"properties":{"a":{"type":"string"},"b":{"type":"string"}}}`,
+		detail: "minProperties (2)",
+		// A struct marshals only its declared properties, so the engine would
+		// count a different property set than the input had.
+		fallback: false,
+	}, {
+		name:     "maxProperties",
+		schema:   `{"type":"object","maxProperties":1,"properties":{"a":{"type":"string"},"b":{"type":"string"}}}`,
+		detail:   "maxProperties (1)",
+		fallback: false,
+	}, {
+		name:     "patternProperties",
+		schema:   `{"type":"object","patternProperties":{"^x-":{"type":"string"}},"properties":{"a":{"type":"string"}}}`,
+		detail:   `patternProperties ("^x-")`,
+		fallback: false,
+	}, {
+		name:     "propertyNames",
+		schema:   `{"type":"object","propertyNames":{"maxLength":3},"properties":{"a":{"type":"string"}}}`,
+		detail:   "propertyNames",
+		fallback: false,
+	}, {
+		name:     "unevaluatedProperties",
+		schema:   `{"type":"object","unevaluatedProperties":false,"properties":{"a":{"type":"string"}}}`,
+		detail:   "unevaluatedProperties",
+		fallback: false,
+	}, {
+		name:   "contains on a property",
+		schema: `{"type":"object","properties":{"t":{"type":"array","items":{"type":"string"},"contains":{"const":"x"}}}}`,
+		detail: `contains on property "t"`,
+		// A slice marshals intact, so delegation sees the same array.
+		fallback: true,
+	}, {
+		name:     "minContains on a property",
+		schema:   `{"type":"object","properties":{"t":{"type":"array","items":{"type":"string"},"minContains":2,"contains":{"const":"x"}}}}`,
+		detail:   `minContains (2) on property "t"`,
+		fallback: true,
+	}, {
+		// The four announced families were only announced on a *type*. On a
+		// property they were dropped as silently as minProperties.
+		name:     "not on a property",
+		schema:   `{"type":"object","properties":{"t":{"type":"string","not":{"const":"x"}}}}`,
+		detail:   `not on property "t"`,
+		fallback: true,
+	}, {
+		name:     "if/then/else on a property",
+		schema:   `{"type":"object","properties":{"t":{"type":"string","if":{"const":"a"},"then":{"maxLength":1}}}}`,
+		detail:   `if/then/else on property "t"`,
+		fallback: true,
+	}, {
+		// fieldChecks skips a pattern RE2 cannot compile, and numeric bounds on a
+		// field that is not a Go numeric. Both were silent drops.
+		name:     "pattern RE2 cannot compile",
+		schema:   `{"type":"object","properties":{"t":{"type":"string","pattern":"(?<=a)b"}}}`,
+		detail:   `pattern (not expressible in RE2) on property "t"`,
+		fallback: true,
+	}, {
+		name:     "numeric bound on a non-numeric field",
+		schema:   `{"type":"object","properties":{"t":{"minimum":3}}}`,
+		detail:   `minimum (the Go type is not a numeric) on property "t"`,
+		fallback: true,
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, report, err := GenerateWithReport(Config{Package: "p", RootName: "Root"}, []byte(tc.schema))
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			// The report is what -strict gates on: it must not be empty.
+			if report.Empty() {
+				t.Fatalf("-strict would pass clean on an unenforced %s:\n%s", tc.name, out)
+			}
+			if !strings.Contains(report.String(), tc.detail) {
+				t.Errorf("report does not name %q:\n%s", tc.detail, report.String())
+			}
+			// The generated source must say the same thing.
+			if !strings.Contains(flowComments(string(out)), tc.detail) {
+				t.Errorf("NOTE does not name %q:\n%s", tc.detail, out)
+			}
+			// And it must not still claim full conformance.
+			if strings.Contains(string(out), "Validate reports whether x satisfies the schema.") {
+				t.Errorf("Validate still claims to satisfy the whole schema:\n%s", out)
+			}
+
+			var found *Unenforced
+			for i, ty := range report.Types {
+				for j, it := range ty.Items {
+					if strings.Contains(it.Detail, tc.detail) {
+						found = &report.Types[i].Items[j]
+					}
+				}
+			}
+			if found == nil {
+				t.Fatalf("no report item with detail %q: %+v", tc.detail, report.Types)
+			}
+			if found.FallbackWouldEnforce != tc.fallback {
+				t.Errorf("FallbackWouldEnforce = %v, want %v for %s (Why: %s)",
+					found.FallbackWouldEnforce, tc.fallback, tc.name, found.Why)
+			}
+			if !tc.fallback && found.Why == "" {
+				t.Errorf("an item the flag cannot fix must say why: %+v", found)
+			}
+		})
+	}
+}
+
+// TestAnnotationKeywordsAreNotReported pins the other half of the invariant: the
+// report names real gaps only. contentEncoding, contentMediaType and
+// contentSchema are annotations in the standard vocabularies — the runtime engine
+// does not assert them either — so reporting them would send readers chasing a
+// constraint that does not exist, and would falsely promise -engine-fallback
+// fixes it.
+func TestAnnotationKeywordsAreNotReported(t *testing.T) {
+	for _, schema := range []string{
+		`{"type":"object","properties":{"t":{"type":"string","contentEncoding":"base64"}}}`,
+		`{"type":"object","properties":{"t":{"type":"string","contentMediaType":"application/json"}}}`,
+		`{"type":"object","properties":{"t":{"type":"string","contentSchema":{"type":"object"}}}}`,
+		// Keywords that assert nothing are not gaps either.
+		`{"type":"object","minProperties":0,"properties":{"a":{"type":"string"}}}`,
+		`{"type":"object","unevaluatedProperties":true,"properties":{"a":{"type":"string"}}}`,
+	} {
+		_, report, err := GenerateWithReport(Config{Package: "p", RootName: "Root"}, []byte(schema))
+		if err != nil {
+			t.Fatalf("generate %s: %v", schema, err)
+		}
+		if !report.Empty() {
+			t.Errorf("nothing is unenforced in %s, but it reported:\n%s", schema, report.String())
+		}
 	}
 }
 
@@ -552,6 +782,93 @@ func TestEngineFallback(t *testing.T) {
 	other := mustDecode(` + "`" + `{"kind":"public"}` + "`" + `)
 	if err := other.Validate(); err != nil {
 		t.Fatalf("non-secret should be valid: %v", err)
+	}
+}
+`
+
+// The same tagged union with the tag written as an `enum` — the most natural
+// spelling, and the one that used to fall off the inline path because the field's
+// Go type was the generated `ItemKind` rather than a bare `string`.
+const enumCondSchema = `{
+  "type": "object",
+  "properties": {"kind": {"enum": ["secret", "public"]}, "value": {"type": "string"}},
+  "if": {"properties": {"kind": {"const": "secret"}}},
+  "then": {"required": ["value"]}
+}`
+
+const enumCondTest = `package gentest
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestEnumDiscriminator(t *testing.T) {
+	mustDecode := func(s string) Item {
+		var x Item
+		if err := json.Unmarshal([]byte(s), &x); err != nil {
+			t.Fatalf("unmarshal %s: %v", s, err)
+		}
+		return x
+	}
+	ok := mustDecode(` + "`" + `{"kind":"secret","value":"x"}` + "`" + `)
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("secret+value should be valid: %v", err)
+	}
+	bad := mustDecode(` + "`" + `{"kind":"secret"}` + "`" + `)
+	if bad.Validate() == nil {
+		t.Fatal("secret without value should fail if/then")
+	}
+	other := mustDecode(` + "`" + `{"kind":"public"}` + "`" + `)
+	if err := other.Validate(); err != nil {
+		t.Fatalf("non-secret should be valid: %v", err)
+	}
+	// The enum still validates its own membership.
+	var bogus Item
+	if err := json.Unmarshal([]byte(` + "`" + `{"kind":"nope","value":"x"}` + "`" + `), &bogus); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if bogus.Validate() == nil {
+		t.Fatal("a value outside the enum should fail")
+	}
+}
+`
+
+// A $ref to a document that is not bundled into the input. Without a way to
+// register it, the engine fails at runtime with "cannot resolve $ref" and the
+// only fix is to re-bundle the schema by hand.
+const remoteRefSchema = `{
+  "type": "object",
+  "properties": {"kind": {"type": "string"}, "value": {"type": "string"}},
+  "dependentSchemas": {"kind": {"$ref": "https://remote.example/r.json"}}
+}`
+
+const remoteRefTest = `package gentest
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestRemoteRefViaAddSchemaResource(t *testing.T) {
+	// Registered before the first Validate, which is when the compiler is built.
+	AddSchemaResource("https://remote.example/r.json", []byte(` + "`" + `{"required":["value"]}` + "`" + `))
+
+	mustDecode := func(s string) Item {
+		var x Item
+		if err := json.Unmarshal([]byte(s), &x); err != nil {
+			t.Fatalf("unmarshal %s: %v", s, err)
+		}
+		return x
+	}
+	ok := mustDecode(` + "`" + `{"kind":"k","value":"v"}` + "`" + `)
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("the remote ref should resolve and pass: %v", err)
+	}
+	// The remote schema is actually applied, not merely resolvable.
+	bad := mustDecode(` + "`" + `{"kind":"k"}` + "`" + `)
+	if bad.Validate() == nil {
+		t.Fatal("kind present without value should fail the remote required")
 	}
 }
 `

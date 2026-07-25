@@ -15,11 +15,15 @@ Related code: `gotype/analyze.go` (`allOfEmbeddable`, `embeddableMember`,
 `emitIfThenElse`, `emitMergeMarshal`, `emitDelegatingValidate`, `emitTypeDoc`),
 and `xvalid.MergeObjects`.
 Pinning tests in `gen/gen_test.go`: `TestGeneratedAllOf`,
-`TestGeneratedDiscriminator`, `TestGeneratedEngineFallback` for the paths that
-are handled, `TestConservativeShapes` for the near misses that must not be,
-`TestGeneratedAllOfMerge` for the flattened marshaling, and
-`TestNoteSaysWhetherFallbackHelps` and `TestReport` for what the generator tells
-you about the gap.
+`TestGeneratedDiscriminator`, `TestGeneratedEnumDiscriminator` and
+`TestGeneratedEngineFallback` for the paths that are handled,
+`TestConservativeShapes` for the near misses that must not be,
+`TestGeneratedAllOfMerge` for the flattened marshaling,
+`TestGeneratedEmptyCollectionsSurvive` for the empty-value round trip,
+`TestGeneratedRemoteRef` for supplying an unbundled `$ref`, and
+`TestNoteSaysWhetherFallbackHelps`, `TestReport`,
+`TestUnmirroredKeywordsAreAnnounced` and `TestAnnotationKeywordsAreNotReported`
+for what the generator tells you about the gap.
 
 ## 1. Summary
 
@@ -249,9 +253,14 @@ lands in the generated `NOTE`, shown in the right-hand column:
    `deprecated`) are ignored, since they never constrain.
    → `if property "kind" is not a plain string const/enum match`
 3. Each of those property names exists as a field on the generated struct whose
-   Go type is exactly `string` — not a named type, not a slice or map.
+   Go type is either a plain `string` or a generated string-underlying `enum`.
+   For an enum the comparison is emitted against the generated constant
+   (`*x.Kind == RootKindSecret`) rather than a bare literal, so it is type-correct
+   and follows a rename of the enum's values. A tag value that is not one of the
+   enum's members is refused instead: the branch could never run.
    → `if property "kind" is not a declared property` /
-   `… is not a plain Go string field`
+   `… is not a string field or string enum` /
+   `… matches "x", which is not one of the RootKind values`
 4. `then` and `else`, when present, constrain **nothing but `required`**, with a
    non-empty list (`isRequiredOnly`).
    → `then constrains more than a non-empty required`
@@ -329,7 +338,8 @@ rule exists:
 | `"if": {"required": ["kind"], "properties": {"kind": {"const": "x"}}}` | `if` carries a keyword other than `properties` (rule 1) |
 | `"if": {"properties": {"n": {"const": 1}}}` | non-string tag (rule 2) |
 | `"if": {"properties": {"kind": {"const": "x", "minLength": 99}}}` | extra assertion on the tag; mirroring only the comparison would drop it (rule 2) |
-| `"properties": {"kind": {"enum": ["secret","public"]}}` + `if` on `kind` | the field's Go type is the generated enum `RootKind`, not `string` (rule 3) — see below |
+| `"properties": {"kind": {"enum": ["secret","public"]}}` + `if` on `"kind": {"const": "other"}` | the tag value is not one of the enum's members, so the branch is unreachable (rule 3) |
+| `"properties": {"kind": {"type": "array", …}}` + `if` on `kind` | the field is not a string or a string enum (rule 3) |
 | `"then": {"properties": {"value": {"minLength": 3}}}` | `then` constrains more than `required` (rule 4) |
 | `"then": {}` or `"then": {"required": []}` | `required` is empty (rule 4) |
 | `"then": {"required": ["value"]}` where `value` is not in `properties` | no field to check it on (rule 5) |
@@ -339,20 +349,29 @@ rule exists:
 a `"type": "string"` alongside a string `const` restates what the `const` already
 implies, so nothing is lost.
 
-The enum row is the most common surprise, because writing the tag as an `enum` is
-the natural thing to do:
+An `enum` tag is fully supported, which is what you want, since writing the tag as
+an `enum` is the natural thing to do:
 
 ```json
 {"properties": {"kind": {"enum": ["secret", "public"]}, "value": {"type": "string"}},
  "if": {"properties": {"kind": {"const": "secret"}}}, "then": {"required": ["value"]}}
 ```
 
-`kind` becomes `*RootKind` (a named string enum with its own `Validate`), rule 3
-fails, and the conditional is not enforced inline — you get the `NOTE`. Options,
-in order of preference: model the whole thing as `oneOf`
-([recipe R1](#r1-preferred-rewrite-a-tagged-union-as-oneof)), declare the tag as
-plain `{"type": "string"}` (losing the enum constants), or enable
-`-engine-fallback`.
+`kind` becomes `*RootKind` (a named string enum with its own `Validate`), and the
+conditional is mirrored against the generated constant:
+
+```go
+if x.Kind == nil || *x.Kind == RootKindSecret {
+	if x.Value == nil {
+		return fmt.Errorf("\"value\" is required here")
+	}
+}
+```
+
+You keep the enum constants *and* the inline conditional, with no engine
+dependency. Modeling the whole thing as `oneOf`
+([recipe R1](#r1-preferred-rewrite-a-tagged-union-as-oneof)) is still better when
+the branches differ by more than a `required` list.
 
 ### `x-go: {"pointer": false}` on a tag field changes the semantics
 
@@ -559,12 +578,23 @@ Facts about this mode:
   `https://other.example/x.json#` while registering the document under the
   retrieval URI; both resolve, so this works.
 - **The compiler is built once** (`sync.OnceValue`) and reused.
-- **Only the input document is embedded.** A `$ref` to a *remote* document is
-  not bundled, and the failure surfaces at runtime the first time the engine
+- **Only the input document is embedded.** A `$ref` to a *remote* document is not
+  bundled, and the failure surfaces at runtime the first time the engine
   evaluates it:
-  `/a: loader: cannot resolve $ref "https://remote.example/r.json#"`. There is no
-  exported hook to add resources to the generated compiler — bundle remote refs
-  into one document before generating ([recipe R6](#r6-bundle-remote-refs-before-generating)).
+  `/a: loader: cannot resolve $ref "https://remote.example/r.json#"`. Register the
+  missing document with the generated `AddSchemaResource` hook:
+
+  ```go
+  func init() {
+      gentest.AddSchemaResource("https://remote.example/r.json", remoteBytes)
+  }
+  ```
+
+  It must run before the first `Validate`, since the compiler is built once on
+  first use. Bundling ahead of time
+  ([recipe R6](#r6-supply-remote-refs-at-runtime-or-bundle-them)) is still an option, and
+  is the only one when you are not using `-engine-fallback` — the hook is emitted
+  with the engine helpers.
 - **Cost:** a dependency on the `jsonschema` package, the schema text in your
   binary, and a marshal + decode round trip per `Validate` call.
 - **It says so when delegation is still not faithful.** Delegation is exact only
@@ -618,23 +648,51 @@ Two consequences:
    Same for `not` on a scalar root, or an `if`/`then` alongside a `oneOf`. Reach
    for [recipe R4](#r4-gate-the-boundary-with-the-engine-on-raw-bytes) for these.
 
-2. **Keywords outside those four families are never covered either.** The
-   generator does not currently enforce `patternProperties`, `propertyNames`,
-   `minProperties`/`maxProperties`, `contains`/`minContains`/`maxContains`,
-   `unevaluatedProperties`/`unevaluatedItems`, or the `content*` keywords, and
-   `needsFallback` does not consider them — so they produce neither a `NOTE` nor
-   a delegating `Validate`. A schema whose only constraint is `minProperties: 2`
-   generates a `Validate` that returns `nil` and claims to satisfy the schema.
+2. **Keywords outside those four families are reported, not enforced.** The
+   generator does not mirror `patternProperties`, `propertyNames`,
+   `minProperties`/`maxProperties`, `contains`/`minContains`/`maxContains`, or
+   `unevaluatedProperties`/`unevaluatedItems`. Each is listed in the `NOTE` and
+   the report, so `-strict` fails on it:
 
-For anything in this list, validate with the engine at the boundary
+   ```go
+   // Validate reports whether x satisfies the constraints this type mirrors inline.
+   //
+   // NOTE: it does not enforce:
+   //   - minProperties (2)
+   //
+   // -engine-fallback cannot enforce "minProperties" here: it validates the
+   // marshaled value of this type, which carries only the properties the Go
+   // type declares, so the property set this keyword reads is not the input's.
+   // Validate the original document with the jsonschema engine instead.
+   func (x *Root) Validate() error {
+   ```
+
+   Whether `-engine-fallback` helps splits by shape. A slice marshals intact, so
+   the `contains` family and `unevaluatedItems` are enforced faithfully by
+   delegation. The object keywords are not: a generated struct marshals only the
+   properties it declares, so the key set the engine sees is not the input's, and
+   a count or a name test over it would be answering a different question.
+
+   The same applies one level down. A keyword on a *property* subschema that
+   `fieldChecks` does not mirror — including `not`, `if`/`then`/`else` and
+   `allOf`, which *are* mirrored on a type — is reported against that property,
+   as are the two conditional drops: a `pattern` RE2 cannot compile, and a
+   numeric bound on a field whose Go type is not `int64` or `float64`.
+
+The `content*` keywords are not in that list and are not a gap: `contentEncoding`,
+`contentMediaType` and `contentSchema` are annotations in the standard
+vocabularies, which the runtime engine does not assert either. There is nothing
+for the generated code to enforce.
+
+For anything that *is* in the list, validate with the engine at the boundary
 ([recipe R4](#r4-gate-the-boundary-with-the-engine-on-raw-bytes)). The engine
 itself is at 100% on the required suite; only the *generated mirror* has these
-gaps.
+gaps — and every one of them is now announced.
 
 ## 6. Known gaps and traps
 
-One remains. It is current behavior, verified by generating, compiling, and
-running the output.
+One remains, and it is announced. This is current behavior, verified by
+generating, compiling, and running the output.
 
 ### 6.1 `-engine-fallback` validates the Go value, not the document
 
@@ -661,32 +719,26 @@ The same mechanism produces **false rejects**: a `then: {"required": ["value"]}`
 naming an undeclared `value` makes the engine see it as permanently absent, so
 every document fails the branch.
 
-**`omitempty` erases empty-but-present values.** Every optional field is tagged
-`omitempty`, so an empty slice or map marshals away:
+**Empty-but-present values survive.** Optional fields are tagged `omitzero`
+(Go 1.24), which omits only the *zero* value. A nil slice is absent; an empty
+non-nil slice is present and marshals as `[]`:
 
 ```json
 {"type": "object", "properties": {"tags": {"type":"array","items":{"type":"string"}}, "kind": {"type":"string"}},
- "dependentSchemas": {"kind": {"required": ["tags"]}}}
-```
-
-```
-input {"kind":"k","tags":[]}  →  marshals to {"kind":"k"}
-Validate() → missing required property "tags"      // false reject
-```
-
-Workaround: drop `omitempty` on that field by overriding the tag through
-`x-go`, which replaces the generated `json` tag wholesale:
-
-```json
-{"tags": {"type": "array", "items": {"type": "string"}, "x-go": {"extraTags": ["json:tags"]}}}
+ "dependentRequired": {"kind": ["tags"]}}
 ```
 
 ```
 input {"kind":"k","tags":[]}  →  marshals to {"kind":"k","tags":[]}  →  Validate() == nil
 ```
 
-(Optional *scalars* are pointers, so `nil` vs `""` survives correctly; the
-problem is specific to slices and maps, which have no pointer wrapper.)
+This used to be `omitempty`, which omits *any* empty value and so erased the
+difference between an absent array and a present empty one — the document above
+marshaled to `{"kind":"k"}` and then failed its own `dependentRequired` check.
+That false reject was the one gap no `NOTE` could warn about, because it depended
+on the value rather than the schema. It is fixed rather than documented now, and
+the `x-go` tag-override workaround it needed is gone.
+`TestGeneratedEmptyCollectionsSurvive` pins the behavior.
 
 **Numbers are safe.** The helper decodes with `UseNumber()`, so integer/precision
 assertions (`multipleOf`, large `int64`) behave. Tuples (`prefixItems`) and
@@ -697,11 +749,10 @@ representation of the document — every property declared, no free-form extras.
 When it isn't, validate the raw bytes instead
 ([recipe R4](#r4-gate-the-boundary-with-the-engine-on-raw-bytes)).
 
-Of the two causes above, the generator detects the first statically — an
-unenforced keyword naming a property the type does not declare — and says so in
-the `NOTE`, in both modes. The second (an `omitempty`-erased empty slice or map)
-depends on the *value* rather than the schema, so no comment can flag it; it is
-why the rule of thumb still matters.
+The remaining cause — an unenforced keyword naming a property the type does not
+declare — the generator detects statically and says so in the `NOTE`, in both
+modes. With the `omitempty` erasure fixed, no gap here is left to value-dependent
+behavior that a comment could not flag.
 
 Composed types no longer belong on this list: since each `allOf` part is
 marshaled separately and merged
@@ -747,7 +798,7 @@ which is what makes the dispatcher discriminate correctly.
 ### R2: keep a conditional on the inline path
 
 If you want to keep `if`/`then`, hold it to the recognized shape
-([§4](#recognition-rule-1)). Miss any of these and you get the `NOTE`, not a
+([§4](#4-inline-path-2-string-discriminator-ifthenelse)). Miss any of these and you get the `NOTE`, not a
 half-enforced `Validate`:
 
 - `if` contains only `properties`.
@@ -845,13 +896,30 @@ the engine dependency. Note that generated parent types call the *generated*
 child `Validate`, not your wrapper, so wrap at the outermost type you actually
 validate.
 
-### R6: bundle remote refs before generating
+### R6: supply remote refs at runtime, or bundle them
 
-`-engine-fallback` embeds only the input document. If it references other
-documents, inline those subschemas into `$defs` (or generate without the flag and
-use [R4](#r4-gate-the-boundary-with-the-engine-on-raw-bytes) with a compiler you
-feed every resource). Otherwise the delegating `Validate` fails at runtime with a
-`$ref` resolution error rather than a validation error.
+`-engine-fallback` embeds only the input document. If it references others, the
+delegating `Validate` fails at runtime with a `$ref` resolution error rather than
+a validation error. Two ways out, in order of preference:
+
+1. **Register the document** with the generated hook, before the first
+   `Validate`:
+
+   ```go
+   //go:embed remote.json
+   var remoteJSON []byte
+
+   func init() { AddSchemaResource("https://remote.example/r.json", remoteJSON) }
+   ```
+
+   The document stays a separate file you can update independently, and the
+   generated code needs no regeneration when it changes.
+
+2. **Bundle ahead of time** by inlining the referenced subschemas into `$defs`.
+   Necessary when you generate *without* `-engine-fallback`, since the hook ships
+   with the engine helpers. Alternatively generate without the flag and use
+   [R4](#r4-gate-the-boundary-with-the-engine-on-raw-bytes) with a compiler you
+   feed every resource yourself.
 
 ## 8. Why it is split this way
 
