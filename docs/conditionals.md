@@ -10,12 +10,14 @@ claims — including the traps in [§6](#6-known-gaps-and-traps) — were checke
 generating the schema, compiling the result, and running it.
 
 Related code: `gotype/analyze.go` (`allOfEmbeddable`, `embeddableMember`,
-`allOfBlocker`, `buildStruct`) and `gen/emit.go` (`unenforced`, `needsFallback`,
+`allOfBlocker`, `buildStruct`), `gen/emit.go` (`unenforced`, `needsFallback`,
 `ifHandled`, `ifBlocker`, `isSimpleStringMatch`, `isRequiredOnly`,
-`emitIfThenElse`, `emitDelegatingValidate`, `emitTypeDoc`).
+`emitIfThenElse`, `emitMergeMarshal`, `emitDelegatingValidate`, `emitTypeDoc`),
+and `xvalid.MergeObjects`.
 Pinning tests in `gen/gen_test.go`: `TestGeneratedAllOf`,
 `TestGeneratedDiscriminator`, `TestGeneratedEngineFallback` for the paths that
 are handled, `TestConservativeShapes` for the near misses that must not be,
+`TestGeneratedAllOfMerge` for the flattened marshaling, and
 `TestNoteSaysWhetherFallbackHelps` and `TestReport` for what the generator tells
 you about the gap.
 
@@ -23,8 +25,8 @@ you about the gap.
 
 | Keyword | Default (`-engine-fallback` off) | With `-engine-fallback` |
 |---|---|---|
-| `allOf` of struct-shaped object schemas | struct embedding, each part's `Validate` called | same (inline; flag has no effect) |
-| `allOf` with any other member | not enforced, `NOTE` comment | `Validate` delegates to the engine (struct declarations only — [§5.3](#53-what-the-fallback-does-not-cover)) |
+| `allOf` of object schemas | struct embedding + merging `MarshalJSON`, each part's `Validate` called | same (inline; flag has no effect) |
+| `allOf` with a non-object member | not enforced, `NOTE` comment | `Validate` delegates to the engine (struct declarations only — [§5.3](#53-what-the-fallback-does-not-cover)) |
 | string-discriminator `if`/`then`/`else` ([§4](#4-inline-path-2-string-discriminator-ifthenelse)) | inline `if`/`else` on the tag field | same (inline; flag has no effect) |
 | any other `if`/`then`/`else` | not enforced, `NOTE` comment | `Validate` delegates to the engine |
 | `not` | not enforced, `NOTE` comment | `Validate` delegates to the engine |
@@ -73,7 +75,7 @@ written anyway — are mirrored inline, and everything else is either flagged
 
 | Keyword | Faithful inline form | Divergence | Status |
 |---|---|---|---|
-| `allOf` of struct-shaped objects | `type X struct { A; B }` | **Low** | inline |
+| `allOf` of object schemas | `type X struct { A; B }` | **Low** | inline |
 | `if` = `const`/`enum` string tag, `then`/`else` add `required` | a Go `if`/`else` on that field | **Low** | inline |
 | general `if` / `then` / `else` | a `satisfiesIf() bool` running full validation | **High** | fallback |
 | general `not` | a `matches() bool`, negated | **High** | fallback |
@@ -88,23 +90,23 @@ written anyway — are mirrored inline, and everything else is either flagged
 - `allOf` is non-empty, and
 - the schema has no `oneOf` and no `anyOf` (those win and produce an interface), and
 - every member — directly or through a `$ref` that resolves within the document —
-  is a schema that will be generated as a Go **struct** (`gotype.embeddableMember`):
-  an object schema with at least one declared property, carrying no `enum`,
+  is an **object schema** (`gotype.embeddableMember`), carrying no `enum`,
   `const`, `oneOf`, `anyOf`, or `x-go` type override.
 
-The struct requirement matters because only a struct promotes its fields when
-embedded. An object schema with no declared properties becomes a `map` alias, and
-embedding a named map would give it a JSON name of its own (`{"Dict": {…}}`)
-rather than merging its keys into the parent — so such a member disqualifies the
-composition instead.
+Both object shapes work: a member with declared properties becomes a struct and
+contributes those properties, and a member without them (a free-form
+`additionalProperties` dictionary) becomes a `map` and contributes its entries.
+Neither ends up nested under its own type name, because the composite gets a
+generated `MarshalJSON` that merges the parts rather than relying on Go's field
+promotion — see [what is emitted](#what-is-emitted) below.
 
 A member whose `$ref` cannot be resolved (e.g. a remote document that was not
 supplied) makes the whole composition non-embeddable.
 
 When a member blocks embedding, `allOfBlocker` records which one and why, and the
-generated `NOTE` names it: `allOf: member 2 is an object schema with no declared
-properties (a dictionary)`, `member 1 is not an object schema`, `member 2 is a
-oneOf/anyOf union`, `member 2: $ref "…" does not resolve`, and so on.
+generated `NOTE` names it: `allOf: member 1 is not an object schema`, `member 2
+is a oneOf/anyOf union`, `member 2 is an enum`, `member 2: $ref "…" does not
+resolve`, and so on.
 
 ### What is emitted
 
@@ -146,6 +148,22 @@ func (x *Root) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (x Root) MarshalJSON() ([]byte, error) {
+	type shadow struct {
+		Own string `json:"own"`
+	}
+	own := shadow{Own: x.Own}
+	ownJSON, err := json.Marshal(own)
+	if err != nil {
+		return nil, err
+	}
+	part0, err := json.Marshal(x.A)
+	if err != nil {
+		return nil, err
+	}
+	return xvalid.MergeObjects(ownJSON, part0)
+}
+
 func (x *Root) Validate() error {
 	if err := x.A.Validate(); err != nil {
 		return err
@@ -154,25 +172,53 @@ func (x *Root) Validate() error {
 }
 ```
 
-Three properties worth naming:
+Four properties worth naming:
 
 - Each part is decoded from the **full** object, so each part enforces its own
   `required` and fills its own promoted fields. `TestGeneratedAllOf` pins this.
 - The parent's own `properties`/`required` coexist with the embedded parts.
+- **Marshaling merges the parts** instead of relying on Go's field promotion.
+  Each part is marshaled on its own and the objects are flattened into one by
+  `xvalid.MergeObjects`, in precedence order: this type's own properties (via a
+  shadow struct, since marshaling `x` would recurse), then each struct part in
+  `allOf` order, then dictionary parts. The first writer of a key wins.
 - `Validate` calls each part's `Validate`, so the parts' field-level assertions
-  (`minLength`, bounds, …) are enforced. Every embeddable member is a struct, so
-  every part has one.
+  (`minLength`, bounds, …) are enforced. A dictionary part is a map with no
+  `Validate`, so it is skipped there; its element type still constrains its
+  values at decode time.
 
 `allOf` inside a property works the same way — the property gets its own named
 type (`RootRec` for `properties.rec`) which does the embedding.
+
+### Why merge rather than promote
+
+Go's promotion rules cannot express the two compositions the schema allows:
+
+- **Two members declaring the same property.** Both parts get an `ID` field at
+  depth 1, so the promoted name is ambiguous and `encoding/json` omits it
+  entirely — the type could not re-read its own output. Merging emits it once,
+  from the first part that has it.
+- **A dictionary member.** It generates a named `map` type, and an embedded
+  non-struct field marshals *under its type name* (`{"Dict": {…}}`) instead of
+  contributing its keys. Merging puts the entries in the same object.
+
+```
+allOf: [Base{id,name}, Audit{id,createdBy}, Extras{additionalProperties}] + own {own}
+input   {"id":"1","name":"n","createdBy":"me","own":"o","extra":"e"}
+marshal {"own":"o","id":"1","name":"n","createdBy":"me","extra":"e"}
+```
+
+`TestGeneratedAllOfMerge` pins that shape, including the round trip back.
+
+One consequence is inherent and stays: a property two members declare is two Go
+fields (`x.Base.ID`, `x.Audit.ID`), and the bare `x.ID` does not compile. Set
+both, or set the one the precedence order picks — the earlier part.
 
 ### Boundaries
 
 | Shape | What happens |
 |---|---|
-| Two members declaring the same property | compiles, but **breaks JSON marshaling** — see [§6.1](#61-overlapping-allof-members-drop-the-shared-property-from-marshaling) |
-| A member that is `{"type":"object"}` with no `properties` (a dictionary) | refused. The parent falls to the default `NOTE` / engine fallback |
-| A member that is a scalar, array, `oneOf`, `enum`/`const`, boolean schema, or an `x-go` type | refused, same as above |
+| A member that is a scalar, array, `oneOf`, `enum`/`const`, boolean schema, or an `x-go` type | refused: it has no properties to contribute to the parent object. The parent falls to the default `NOTE` / engine fallback |
 | Unresolvable `$ref` member | refused, same as above |
 
 "Falls to the default `NOTE` / engine fallback" means: if the parent schema is
@@ -387,7 +433,7 @@ flag is never the answer, whatever the keywords are:
 // Root is generated from its JSON Schema.
 //
 // NOTE: nothing generated for this type enforces:
-//   - allOf: member 2 is an object schema with no declared properties (a dictionary)
+//   - allOf: member 1 is not an object schema
 //
 // -engine-fallback cannot enforce these: it rewrites Validate methods, and
 // this type has none. Validate values of this type against the schema with
@@ -443,7 +489,7 @@ $ jsonschema-gen -package demo -root Item item.schema.json > item.gen.go
       jsonschema engine
 
   Meta (no Validate method: not a struct or enum)
-    - allOf: member 1 is an object schema with no declared properties (a dictionary)
+    - allOf: member 1 is not an object schema
       fix: validate the document with the jsonschema engine — -engine-fallback
       cannot enforce this: it rewrites Validate methods, and this type has none
 
@@ -539,7 +585,7 @@ Facts about this mode:
   ```
 
   The mechanics of why are in
-  [§6.2](#62--engine-fallback-validates-the-go-value-not-the-document); the point
+  [§6.1](#61--engine-fallback-validates-the-go-value-not-the-document); the point
   here is that you are told, at the call site, instead of having to know.
 
 ### 5.3 What the fallback does *not* cover
@@ -587,38 +633,10 @@ gaps.
 
 ## 6. Known gaps and traps
 
-Two remain. Both are current behavior, verified by generating, compiling, and
+One remains. It is current behavior, verified by generating, compiling, and
 running the output.
 
-### 6.1 Overlapping `allOf` members drop the shared property from marshaling
-
-```json
-{"allOf": [{"$ref": "#/$defs/a"}, {"$ref": "#/$defs/b"}],
- "$defs": {"a": {"type": "object", "required": ["id"], "properties": {"id": {"type":"string"}, "x": {"type":"string"}}},
-           "b": {"type": "object", "properties": {"id": {"type":"string"}, "y": {"type":"string"}}}}}
-```
-
-`Root` embeds both `A` and `B`, each with an `ID` field at depth 1. Go's
-embedding rules make the promoted name ambiguous: `x.ID` does not compile (you
-must write `x.A.ID`), and `encoding/json` **omits the field entirely** from
-output. Decoding works — both `A.ID` and `B.ID` are filled — but the generated
-type does not round-trip through its own marshaler:
-
-```
-unmarshal {"id":"1","x":"xx","y":"yy"}  →  A.ID="1", B.ID="1"
-marshal                                 →  {"x":"xx","y":"yy"}          // id gone
-re-unmarshal that output                →  error: missing required property "id"
-```
-
-Under `-engine-fallback` this is worse than cosmetic: validation marshals the
-value first, so the dropped property looks absent to the engine and any
-`required`/`dependentSchemas` mentioning it fails.
-
-**Workarounds:** keep `allOf` members disjoint (the clean, common case — hoist
-shared properties into the parent schema instead of repeating them in members);
-or rename one side with `x-go: {"name": …}`; or don't compose with `allOf` here.
-
-### 6.2 `-engine-fallback` validates the Go value, not the document
+### 6.1 `-engine-fallback` validates the Go value, not the document
 
 The delegating `Validate` marshals `x` and validates the result. Anything the Go
 type cannot represent, or that `encoding/json` alters, is invisible to — or
@@ -675,15 +693,20 @@ assertions (`multipleOf`, large `int64`) behave. Tuples (`prefixItems`) and
 `oneOf` interface fields marshal back to their correct JSON shapes.
 
 Rule of thumb: `-engine-fallback` is exact when the Go type is a faithful
-representation of the document — every property declared, no free-form extras,
-no ambiguous embedding. When it isn't, validate the raw bytes instead
+representation of the document — every property declared, no free-form extras.
+When it isn't, validate the raw bytes instead
 ([recipe R4](#r4-gate-the-boundary-with-the-engine-on-raw-bytes)).
 
-Of the three causes above, the generator detects the first statically — an
+Of the two causes above, the generator detects the first statically — an
 unenforced keyword naming a property the type does not declare — and says so in
-the `NOTE`, in both modes. The other two (an `omitempty`-erased empty slice, an
-ambiguous embedded field) depend on the *value* rather than the schema, so no
-comment can flag them; they are why the rule of thumb still matters.
+the `NOTE`, in both modes. The second (an `omitempty`-erased empty slice or map)
+depends on the *value* rather than the schema, so no comment can flag it; it is
+why the rule of thumb still matters.
+
+Composed types no longer belong on this list: since each `allOf` part is
+marshaled separately and merged
+([§3](#why-merge-rather-than-promote)), a property two parts declare reaches the
+engine instead of being dropped as an ambiguous promoted field.
 
 ## 7. Recipes
 
@@ -749,7 +772,7 @@ engineFallback: true
 baseURI: https://example.com/s.json
 ```
 
-Right choice when the types are faithful to the document ([§6.2](#62--engine-fallback-validates-the-go-value-not-the-document)) and the schema
+Right choice when the types are faithful to the document ([§6.1](#61--engine-fallback-validates-the-go-value-not-the-document)) and the schema
 is self-contained. Read [§5.3](#53-what-the-fallback-does-not-cover) for what it
 still won't cover.
 
@@ -790,7 +813,7 @@ func (g *Gate) Decode(data []byte, out any) error {
 ```
 
 ```
-{"a":"x","ghost":1}  →  /: value must not match the subschema   // caught, unlike §6.2
+{"a":"x","ghost":1}  →  /: value must not match the subschema   // caught, unlike §6.1
 {"a":"x"}            →  nil
 ```
 

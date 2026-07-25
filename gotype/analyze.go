@@ -306,11 +306,12 @@ func (a *analyzer) allOfEmbeddable(s *ir.Schema) bool {
 	return true
 }
 
-// embeddableMember reports whether an allOf member becomes a struct type. Only
-// a struct promotes its fields when embedded: an object schema with no declared
-// properties becomes a map alias, and an enum/const/union/x-go member becomes
-// some other named type — embedding either would give the member a JSON name of
-// its own (`{"Dict": {…}}`) instead of merging its properties into the parent.
+// embeddableMember reports whether an allOf member can be embedded. It must be
+// an object schema, so that its content belongs in the same JSON object as the
+// parent's: a struct member contributes its properties, and a dictionary member
+// (an object schema with no declared properties, generated as a map) contributes
+// its entries. The generated MarshalJSON merges the parts into one flat object,
+// so neither shape gets a JSON name of its own.
 func embeddableMember(s *ir.Schema) bool {
 	return memberBlocker(s) == ""
 }
@@ -330,8 +331,6 @@ func memberBlocker(s *ir.Schema) string {
 		return "a oneOf/anyOf union"
 	case !isObject(s):
 		return "not an object schema"
-	case len(s.Properties) == 0:
-		return "an object schema with no declared properties (a dictionary)"
 	}
 	return ""
 }

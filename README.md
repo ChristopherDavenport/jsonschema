@@ -387,10 +387,10 @@ case *Bank:
 
 ### 5. `allOf` — composition as struct embedding
 
-An `allOf` whose every member is generated as a struct — an object schema with
-declared properties, directly or through a `$ref` — becomes Go struct embedding.
-Each part decodes from the full object (so it enforces its own `required`), and
-the composite `Validate` delegates to each part.
+An `allOf` whose every member is an object schema — directly or through a `$ref` —
+becomes Go struct embedding. Each part decodes from the full object (so it
+enforces its own `required`), the composite `Validate` delegates to each part,
+and a generated `MarshalJSON` merges the parts back into one flat object.
 
 ```json
 {
@@ -434,9 +434,22 @@ func (x *Record) Validate() error {
 ```
 
 `x.ID` and `x.CreatedBy` are promoted, so `Record` reads like one flat struct.
-Members that would not be structs — a free-form dictionary, a scalar, a union —
-are refused rather than embedded, since embedding those would change the JSON
-shape; that composition falls to one of the two modes below.
+
+Marshaling merges the parts rather than relying on Go's promotion rules, which
+cannot express two of the compositions the schema allows: a property declared by
+two members would be an ambiguous promoted field and get dropped from the output
+entirely, and a free-form `additionalProperties` member is a `map` that would
+nest under its own type name. Merging emits one flat object either way, with the
+earlier part winning a shared key:
+
+```
+allOf: [Base{id,name}, Audit{id,createdBy}, Extras{additionalProperties}]
+{"id":"1","name":"n","createdBy":"me","extra":"e"}   // in, and back out again
+```
+
+Members that are not object schemas — a scalar, an array, a union — have no
+properties to contribute, so those compositions fall to one of the two modes
+below.
 
 ### 6. `if`/`then`/`else` — conditional requirements
 
@@ -642,7 +655,7 @@ wrote item.gen.go
       jsonschema engine
 
   Meta (no Validate method: not a struct or enum)
-    - allOf: member 1 is an object schema with no declared properties (a dictionary)
+    - allOf: member 1 is not an object schema
       fix: validate the document with the jsonschema engine — -engine-fallback
       cannot enforce this: it rewrites Validate methods, and this type has none
 

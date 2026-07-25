@@ -108,6 +108,14 @@ func TestGeneratedAllOf(t *testing.T) {
 	runInModule(t, allOfSchema, Config{Package: "gentest", RootName: "Record"}, allOfTest)
 }
 
+// TestGeneratedAllOfMerge proves the composed type marshals as one flat object:
+// a property two parts declare is emitted once rather than dropped as an
+// ambiguous promoted field, and a dictionary part contributes its entries
+// instead of nesting under its type name. Both round-trip.
+func TestGeneratedAllOfMerge(t *testing.T) {
+	runInModule(t, mergeSchema, Config{Package: "gentest", RootName: "Record"}, mergeTest)
+}
+
 // TestConservativeShapes pins the shapes that look like an inline path but are
 // deliberately refused, so they surface as a NOTE instead of a Validate that
 // quietly ignores part of the schema.
@@ -131,11 +139,11 @@ func TestConservativeShapes(t *testing.T) {
 		note:    `if property "kind" is not a plain string const/enum match`,
 		comment: "minLength inside the if would be dropped by a plain tag comparison",
 	}, {
-		name:    "allOf member is a dictionary, not a struct",
-		schema:  `{"allOf":[{"$ref":"#/$defs/a"},{"$ref":"#/$defs/dict"}],"$defs":{"a":{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}},"dict":{"type":"object","additionalProperties":{"type":"string"}}}}`,
-		absent:  "\tDict\n",
-		note:    "allOf: member 2 is an object schema with no declared properties",
-		comment: "embedding a named map type would marshal as {\"Dict\":{…}}",
+		name:    "allOf member is not an object schema",
+		schema:  `{"allOf":[{"type":"string","minLength":2},{"$ref":"#/$defs/a"}],"$defs":{"a":{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}}}`,
+		absent:  "\tA\n",
+		note:    "allOf: member 1 is not an object schema",
+		comment: "a scalar member has no properties to merge into the parent object",
 	}, {
 		// The if/then here IS mirrored; only `not` is not. The NOTE must say so
 		// rather than implicating the whole family.
@@ -579,6 +587,75 @@ func TestAllOf(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(` + "`" + `{"createdBy":"me"}` + "`" + `), &r); err == nil {
 		t.Fatal("missing id (from Base) should fail")
+	}
+}
+`
+
+// mergeSchema composes an overlapping pair of object members with a free-form
+// dictionary member, and adds a property of its own.
+const mergeSchema = `{
+  "type": "object",
+  "properties": {"own": {"type": "string"}},
+  "allOf": [{"$ref": "#/$defs/base"}, {"$ref": "#/$defs/audit"}, {"$ref": "#/$defs/extras"}],
+  "$defs": {
+    "base":   {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}, "name": {"type": "string"}}},
+    "audit":  {"type": "object", "properties": {"id": {"type": "string"}, "createdBy": {"type": "string"}}},
+    "extras": {"type": "object", "additionalProperties": {"type": "string"}}
+  }
+}`
+
+const mergeTest = `package gentest
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestAllOfMerge(t *testing.T) {
+	const doc = ` + "`" + `{"id":"1","name":"n","createdBy":"me","own":"o","extra":"e"}` + "`" + `
+	var r Record
+	if err := json.Unmarshal([]byte(doc), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.Base.ID != "1" || r.Audit.ID == nil || *r.Audit.ID != "1" {
+		t.Fatalf("both parts should see the shared property: %+v", r)
+	}
+	if r.Extras["extra"] != "e" {
+		t.Fatalf("dictionary part missed the extra key: %v", r.Extras)
+	}
+
+	b, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// One flat object: the shared "id" appears once, the dictionary's entries
+	// sit alongside the declared properties, and nothing nests under "Extras".
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("marshal produced invalid JSON %s: %v", b, err)
+	}
+	for k, want := range map[string]any{"id": "1", "name": "n", "createdBy": "me", "own": "o", "extra": "e"} {
+		if got[k] != want {
+			t.Errorf("marshaled %s: got[%q] = %v, want %v", b, k, got[k], want)
+		}
+	}
+	if _, nested := got["Extras"]; nested {
+		t.Errorf("dictionary part nested under its type name: %s", b)
+	}
+	if len(got) != 5 {
+		t.Errorf("unexpected keys in %s", b)
+	}
+
+	// The type reads back its own output — this is what ambiguous promotion broke.
+	var back Record
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("re-unmarshal own output %s: %v", b, err)
+	}
+	if back.Base.ID != "1" || back.Own == nil || *back.Own != "o" {
+		t.Fatalf("round trip lost data: %+v", back)
+	}
+	if err := back.Validate(); err != nil {
+		t.Fatalf("valid record rejected: %v", err)
 	}
 }
 `

@@ -314,8 +314,82 @@ func (e *emitter) emitStruct(f *jen.File, d *gotype.Decl) {
 		e.emitTupleMarshal(f, d)
 	} else {
 		e.emitUnmarshal(f, d)
+		if len(d.Embeds) > 0 {
+			e.emitMergeMarshal(f, d)
+		}
 	}
 	e.emitStructValidate(f, d)
+}
+
+// emitMergeMarshal generates MarshalJSON for a type composed by allOf. Go's
+// field promotion cannot express the composition on its own: two parts
+// declaring the same property make it ambiguous, and encoding/json then omits
+// it, while a dictionary part is a named map and would nest under its type name.
+// Marshaling each part separately and merging the objects avoids both.
+//
+// Parts are passed in precedence order — this type's own properties, then each
+// struct part in allOf order, then dictionary parts, which only fill keys no
+// declared property claimed.
+func (e *emitter) emitMergeMarshal(f *jen.File, d *gotype.Decl) {
+	var body []jen.Code
+	var parts []jen.Code
+
+	// Marshal an expression into a fresh variable, and remember it as a part.
+	marshal := func(name string, expr jen.Code) {
+		body = append(body,
+			jen.List(jen.Id(name), jen.Err()).Op(":=").Qual("encoding/json", "Marshal").Call(expr),
+			jen.If(jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Nil(), jen.Err())),
+		)
+		parts = append(parts, jen.Id(name))
+	}
+
+	// This type's own properties win over anything a part contributes. They go
+	// through a shadow struct because marshaling x itself would recurse.
+	if len(d.Fields) > 0 {
+		shadowFields := make([]jen.Code, 0, len(d.Fields))
+		values := jen.Dict{}
+		for _, fld := range d.Fields {
+			tag := fld.JSONName
+			if !fld.Required {
+				tag += ",omitempty"
+			}
+			shadowFields = append(shadowFields, jen.Id(fld.Name).Add(e.fieldType(fld)).Tag(map[string]string{"json": tag}))
+			values[jen.Id(fld.Name)] = jen.Id("x").Dot(fld.Name)
+		}
+		body = append(body,
+			jen.Type().Id("shadow").Struct(shadowFields...),
+			jen.Id("own").Op(":=").Id("shadow").Values(values),
+		)
+		marshal("ownJSON", jen.Id("own"))
+	}
+
+	// Struct parts first, then dictionary parts.
+	var dicts []*gotype.TypeRef
+	for i, emb := range d.Embeds {
+		if e.isMapDecl(emb.Named) {
+			dicts = append(dicts, emb)
+			continue
+		}
+		marshal(fmt.Sprintf("part%d", i), jen.Id("x").Dot(emb.Named))
+	}
+	for i, emb := range dicts {
+		marshal(fmt.Sprintf("rest%d", i), jen.Id("x").Dot(emb.Named))
+	}
+
+	body = append(body, jen.Return(jen.Qual(xvalidPkg, "MergeObjects").Call(parts...)))
+
+	f.Comment("MarshalJSON encodes " + d.Name + " as one flat JSON object, merging its own")
+	f.Comment("properties with those of each embedded allOf part. Where parts declare the")
+	f.Comment("same property, the first to define it wins: this type's own properties, then")
+	f.Comment("each part in order, then any free-form dictionary part.")
+	f.Func().Params(jen.Id("x").Id(d.Name)).Id("MarshalJSON").Params().Params(jen.Index().Byte(), jen.Error()).Block(body...)
+}
+
+// isMapDecl reports whether a named declaration is a map type — a dictionary
+// allOf member, which contributes entries rather than declared properties.
+func (e *emitter) isMapDecl(name string) bool {
+	d := e.declByName[name]
+	return d != nil && d.Kind == gotype.Alias && d.Underlying != nil && d.Underlying.Map != nil
 }
 
 // emitTupleMarshal generates array-shaped (Un)MarshalJSON for a positional
