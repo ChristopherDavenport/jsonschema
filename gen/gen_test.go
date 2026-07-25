@@ -233,6 +233,71 @@ func TestNoteSaysWhetherFallbackHelps(t *testing.T) {
 	}
 }
 
+// TestReport pins the machine-readable report the CLI prints: it lists exactly
+// what the output does not enforce, and drops an item once the generated code
+// actually enforces it.
+func TestReport(t *testing.T) {
+	const schema = `{"type":"object",
+	  "properties":{"kind":{"type":"string"},"value":{"type":"string"}},
+	  "dependentSchemas":{"kind":{"required":["value"]}},
+	  "not":{"required":["ghost"]}}`
+
+	_, report, err := GenerateWithReport(Config{Package: "p", RootName: "Item"}, []byte(schema))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if report.Empty() || len(report.Types) != 1 {
+		t.Fatalf("want one reported type, got %+v", report)
+	}
+	got := report.Types[0]
+	if got.Type != "Item" || !got.HasValidate || got.Delegates {
+		t.Errorf("type report wrong: %+v", got)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("want both keywords reported, got %+v", got.Items)
+	}
+	byKeyword := map[string]Unenforced{}
+	for _, it := range got.Items {
+		byKeyword[it.Keyword] = it
+	}
+	if it := byKeyword["dependentSchemas"]; !it.FallbackWouldEnforce {
+		t.Errorf("dependentSchemas over declared properties is fixable by the flag: %+v", it)
+	}
+	if it := byKeyword["not"]; it.FallbackWouldEnforce || len(it.Properties) != 1 || it.Properties[0] != "ghost" {
+		t.Errorf(`not over an undeclared "ghost" is not fixable by the flag: %+v`, it)
+	}
+	if n := report.FallbackWouldFix(); n != 1 {
+		t.Errorf("FallbackWouldFix() = %d, want 1", n)
+	}
+	if s := report.String(); !strings.Contains(s, "Item") || !strings.Contains(s, "would enforce 1 constraint") {
+		t.Errorf("rendered report reads wrong:\n%s", s)
+	}
+
+	// With the flag on, the engine enforces dependentSchemas, so only the item
+	// the marshal round trip cannot carry is still reported.
+	_, report, err = GenerateWithReport(Config{Package: "p", RootName: "Item", EngineFallback: true}, []byte(schema))
+	if err != nil {
+		t.Fatalf("generate with fallback: %v", err)
+	}
+	if len(report.Types) != 1 || len(report.Types[0].Items) != 1 ||
+		report.Types[0].Items[0].Keyword != "not" || !report.Types[0].Delegates {
+		t.Errorf("with -engine-fallback, want only `not` reported on a delegating type: %+v", report.Types)
+	}
+	if n := report.FallbackWouldFix(); n != 0 {
+		t.Errorf("nothing left for the flag to fix, got %d", n)
+	}
+
+	// A schema the generator mirrors completely reports nothing.
+	_, report, err = GenerateWithReport(Config{Package: "p", RootName: "Clean"},
+		[]byte(`{"type":"object","required":["a"],"properties":{"a":{"type":"string","minLength":2}}}`))
+	if err != nil {
+		t.Fatalf("generate clean: %v", err)
+	}
+	if !report.Empty() || report.String() != "" {
+		t.Errorf("fully-enforced schema should report nothing, got %+v", report)
+	}
+}
+
 // flowComments strips comment markers and collapses whitespace, so a test can
 // match a sentence without caring where the generator wrapped it.
 func flowComments(src string) string {

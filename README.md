@@ -622,6 +622,40 @@ inline path recognizes, the near misses, the two remaining gaps, and recipes for
 working around them. Either way, the runtime engine is always available for
 complete coverage.
 
+You do not have to read the generated source to find these: `jsonschema-gen`
+prints the same information to stderr as it generates, so it lands in your
+`go generate` log.
+
+```console
+$ jsonschema-gen -package demo -root Item -o item.gen.go item.schema.json
+wrote item.gen.go
+
+3 constraints in 2 types not enforced by the generated code:
+
+  Item
+    - not
+      fix: validate the document with the jsonschema engine — -engine-fallback
+      cannot enforce this: it validates the marshaled value of this type, which
+      never carries the properties this keyword constrains ("ghost")
+    - dependentSchemas ("kind")
+      fix: regenerate with -engine-fallback, or validate the document with the
+      jsonschema engine
+
+  Meta (no Validate method: not a struct or enum)
+    - allOf: member 1 is an object schema with no declared properties (a dictionary)
+      fix: validate the document with the jsonschema engine — -engine-fallback
+      cannot enforce this: it rewrites Validate methods, and this type has none
+
+Regenerating with -engine-fallback would enforce 1 constraint.
+```
+
+A schema the generator mirrors completely prints nothing. Regenerating the same
+schema with `-engine-fallback` drops the `dependentSchemas` line — the engine
+enforces it now — and keeps the other two, which it genuinely cannot. Pass
+`-strict` to exit non-zero while anything remains unenforced, for a CI gate; the
+report prints either way. Programmatically, `gen.GenerateWithReport` returns the
+same thing as a `*gen.Report`.
+
 The CLI takes these values as flags or from a YAML config (`-config gen.yaml`,
 with flags overriding it):
 
@@ -629,6 +663,7 @@ with flags overriding it):
 package: person
 rootName: Person
 assertFormat: true
+strict: true
 input: person.schema.json
 output: person.gen.go
 ```

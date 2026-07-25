@@ -26,6 +26,7 @@ type emitter struct {
 	declByName  map[string]*gotype.Decl
 	patterns    []patternVar
 	needEngine  bool // an engine-fallback helper block must be emitted
+	report      Report
 }
 
 const enginePkg = "github.com/ChristopherDavenport/jsonschema"
@@ -109,6 +110,39 @@ func (e *emitter) unenforced(d *gotype.Decl) []unenforcedItem {
 		add("allOf", "allOf: "+why, s.AllOf...)
 	}
 	return out
+}
+
+// collectUnenforced adds this declaration's unenforced keywords to the report,
+// with the remedy that applies to it. It deliberately mirrors what the NOTE
+// comments say: an item the delegating Validate does enforce is not reported.
+func (e *emitter) collectUnenforced(d *gotype.Decl) {
+	items := e.unenforced(d)
+	if len(items) == 0 {
+		return
+	}
+	hasValidate := e.hasValidate[d.Name]
+	delegates := e.hybrid(d)
+
+	tr := TypeReport{Type: d.Name, HasValidate: hasValidate, Delegates: delegates}
+	for _, it := range items {
+		u := Unenforced{Keyword: it.keyword, Detail: it.detail}
+		switch {
+		case d.Kind != gotype.Struct:
+			u.Why = "it rewrites Validate methods, and this type has none"
+		case !it.engineCanEnforce():
+			// Properties are named only here: they are what the round trip loses.
+			u.Properties = it.unseen
+			u.Why = "it validates the marshaled value of this type, which never carries the properties this keyword constrains"
+		case delegates:
+			continue // the delegating Validate already enforces this one
+		default:
+			u.FallbackWouldEnforce = true
+		}
+		tr.Items = append(tr.Items, u)
+	}
+	if len(tr.Items) > 0 {
+		e.report.Types = append(e.report.Types, tr)
+	}
 }
 
 // declaredJSON is the set of JSON property names this type can hold: its own
@@ -209,6 +243,12 @@ func (e *emitter) emit() ([]byte, error) {
 		if d.Kind == gotype.Interface {
 			e.isInterface[d.Name] = true
 		}
+	}
+
+	// Record what the output will not enforce, in declaration order, so callers
+	// can report the same thing the NOTE comments say.
+	for _, d := range e.model.Decls {
+		e.collectUnenforced(d)
 	}
 
 	for _, d := range e.model.Decls {

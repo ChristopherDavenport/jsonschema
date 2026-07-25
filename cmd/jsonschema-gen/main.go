@@ -31,6 +31,7 @@ type fileConfig struct {
 	Input          *string `yaml:"input"`
 	Output         *string `yaml:"output"`
 	EngineFallback *bool   `yaml:"engineFallback"`
+	Strict         *bool   `yaml:"strict"`
 }
 
 func main() {
@@ -47,6 +48,7 @@ func run() error {
 	assertFormat := flag.Bool("assert-format", false, "emit `format` assertions in Validate methods")
 	baseURI := flag.String("base-uri", "", "base URI used to resolve references")
 	engineFallback := flag.Bool("engine-fallback", false, "for types using if/then/else, dependentSchemas, not, or allOf, delegate Validate to the embedded schema + runtime engine (full conformance, adds a dependency on the jsonschema package)")
+	strict := flag.Bool("strict", false, "exit non-zero when the generated code does not enforce every constraint (the report is printed either way)")
 	configPath := flag.String("config", "", "YAML config file (flags override its values)")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: jsonschema-gen [flags] <schema.json>")
@@ -82,6 +84,9 @@ func run() error {
 		if !set["engine-fallback"] && fc.EngineFallback != nil {
 			*engineFallback = *fc.EngineFallback
 		}
+		if !set["strict"] && fc.Strict != nil {
+			*strict = *fc.Strict
+		}
 		if input == "" && fc.Input != nil {
 			input = *fc.Input
 		}
@@ -97,7 +102,7 @@ func run() error {
 		return fmt.Errorf("read schema: %w", err)
 	}
 
-	src, err := gen.Generate(gen.Config{
+	src, report, err := gen.GenerateWithReport(gen.Config{
 		Package:        *pkg,
 		RootName:       *root,
 		BaseURI:        *baseURI,
@@ -109,13 +114,24 @@ func run() error {
 	}
 
 	if *out == "" {
-		_, err = os.Stdout.Write(src)
-		return err
+		if _, err := os.Stdout.Write(src); err != nil {
+			return err
+		}
+	} else {
+		if err := os.WriteFile(*out, src, 0o644); err != nil {
+			return fmt.Errorf("write output: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
 	}
-	if err := os.WriteFile(*out, src, 0o644); err != nil {
-		return fmt.Errorf("write output: %w", err)
+
+	// Report what the output does not enforce. This goes to stderr so it shows
+	// up in `go generate` logs even when the source itself goes to stdout.
+	if !report.Empty() {
+		fmt.Fprint(os.Stderr, "\n", report.String())
+		if *strict {
+			return fmt.Errorf("unenforced constraints (-strict)")
+		}
 	}
-	fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
 	return nil
 }
 

@@ -33,11 +33,20 @@ type Config struct {
 	EngineFallback bool
 }
 
-// Generate parses a schema document and returns formatted Go source.
+// Generate parses a schema document and returns formatted Go source. Use
+// [GenerateWithReport] to also learn what the output does not enforce.
 func Generate(cfg Config, data []byte) ([]byte, error) {
+	src, _, err := GenerateWithReport(cfg, data)
+	return src, err
+}
+
+// GenerateWithReport is [Generate] plus a [Report] of the constraints the
+// generated code does not enforce — the same information the NOTE comments in
+// the output carry, so a caller can surface it at generation time.
+func GenerateWithReport(cfg Config, data []byte) ([]byte, *Report, error) {
 	var s ir.Schema
 	if err := json.Unmarshal(data, &s); err != nil {
-		return nil, fmt.Errorf("gen: parse schema: %w", err)
+		return nil, nil, fmt.Errorf("gen: parse schema: %w", err)
 	}
 
 	draft := cfg.DefaultDraft
@@ -54,15 +63,20 @@ func Generate(cfg Config, data []byte) ([]byte, error) {
 		RootName: cfg.RootName,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return (&emitter{
+	e := &emitter{
 		cfg:         cfg,
 		model:       model,
 		docBytes:    data,
 		hasValidate: map[string]bool{},
 		isInterface: map[string]bool{},
 		declByName:  map[string]*gotype.Decl{},
-	}).emit()
+	}
+	src, err := e.emit()
+	if err != nil {
+		return nil, nil, err
+	}
+	return src, &e.report, nil
 }

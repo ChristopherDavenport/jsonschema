@@ -15,7 +15,9 @@ Related code: `gotype/analyze.go` (`allOfEmbeddable`, `embeddableMember`,
 `emitIfThenElse`, `emitDelegatingValidate`, `emitTypeDoc`).
 Pinning tests in `gen/gen_test.go`: `TestGeneratedAllOf`,
 `TestGeneratedDiscriminator`, `TestGeneratedEngineFallback` for the paths that
-are handled, `TestConservativeShapes` for the near misses that must not be.
+are handled, `TestConservativeShapes` for the near misses that must not be,
+`TestNoteSaysWhetherFallbackHelps` and `TestReport` for what the generator tells
+you about the gap.
 
 ## 1. Summary
 
@@ -420,6 +422,46 @@ in-place applicators only) against the names the type can hold, including those
 promoted from embedded `allOf` parts.
 
 Output in this mode depends only on the standard library and `xvalid`.
+
+#### The same information at generation time
+
+You should not have to read the output to discover a gap. `jsonschema-gen` prints
+every `NOTE` it emitted to stderr, grouped by type:
+
+```console
+$ jsonschema-gen -package demo -root Item item.schema.json > item.gen.go
+
+3 constraints in 2 types not enforced by the generated code:
+
+  Item
+    - not
+      fix: validate the document with the jsonschema engine — -engine-fallback
+      cannot enforce this: it validates the marshaled value of this type, which
+      never carries the properties this keyword constrains ("ghost")
+    - dependentSchemas ("kind")
+      fix: regenerate with -engine-fallback, or validate the document with the
+      jsonschema engine
+
+  Meta (no Validate method: not a struct or enum)
+    - allOf: member 1 is an object schema with no declared properties (a dictionary)
+      fix: validate the document with the jsonschema engine — -engine-fallback
+      cannot enforce this: it rewrites Validate methods, and this type has none
+
+Regenerating with -engine-fallback would enforce 1 constraint.
+```
+
+- It reports what the output *actually* leaves unenforced, so running with
+  `-engine-fallback` drops the `dependentSchemas` line (the engine enforces it
+  now) and keeps the two it cannot.
+- A schema mirrored completely prints nothing at all.
+- `-strict` exits non-zero while anything is unenforced — a CI gate against a
+  schema silently growing a keyword the generated code ignores. The report is
+  printed either way.
+
+For programmatic use, `gen.GenerateWithReport` returns the same data as a
+`*gen.Report` (`Types`, each with `Items` naming the keyword, whether
+`-engine-fallback` would enforce it, and which properties the round trip loses).
+`gen.Generate` still exists and discards it.
 
 ### 5.2 `-engine-fallback`: engine conformance for struct types
 
