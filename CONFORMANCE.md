@@ -32,8 +32,15 @@ the following are implemented:
 ## Remaining limitation
 
 Go's `regexp` is RE2, so `pattern` constructs that RE2 lacks *entirely* —
-lookaround and backreferences — are still unsupported. These do not appear in the
-required test set (they live under `optional/`) and are an inherent,
-ecosystem-wide limitation of every Go validator. The `optional/format/*` suite is
-also not run by default, since `format` is annotation-only unless assertion is
-enabled.
+lookaround and backreferences — are unsupported **by default**. These do not
+appear in the required test set (they live under `optional/`).
+
+This is a limitation of the standard library, not of Go: the engine is pluggable
+via `xvalid.UseRegexpEngine`, so a schema needing ECMA-262 semantics can be served
+by supplying an engine that implements them (for example one backed by
+`dlclark/regexp2`). The library does not depend on one itself, because RE2's
+linear-time matching is the right default — a backtracking engine can be driven
+into pathological running times by hostile input.
+
+The `optional/format/*` suite is also not run by default, since `format` is
+annotation-only unless assertion is enabled.

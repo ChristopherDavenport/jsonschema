@@ -11,13 +11,13 @@ import (
 
 // Person is generated from its JSON Schema.
 type Person struct {
-	Address *Address    `json:"address,omitempty"`
-	Age     *int64      `json:"age,omitempty"`
-	Email   *string     `json:"email,omitempty"`
+	Address *Address    `json:"address,omitzero"`
+	Age     *int64      `json:"age,omitzero"`
+	Email   *string     `json:"email,omitzero"`
 	ID      string      `json:"id"`
 	Name    string      `json:"name"`
-	Role    *PersonRole `json:"role,omitempty"`
-	Tags    []string    `json:"tags,omitempty"`
+	Role    *PersonRole `json:"role,omitzero"`
+	Tags    []string    `json:"tags,omitzero"`
 }
 
 // UnmarshalJSON decodes data into Person, enforcing required properties.
@@ -32,13 +32,13 @@ func (x *Person) UnmarshalJSON(data []byte) error {
 		}
 	}
 	type shadow struct {
-		Address *Address    `json:"address,omitempty"`
-		Age     *int64      `json:"age,omitempty"`
-		Email   *string     `json:"email,omitempty"`
+		Address *Address    `json:"address,omitzero"`
+		Age     *int64      `json:"age,omitzero"`
+		Email   *string     `json:"email,omitzero"`
 		ID      string      `json:"id"`
 		Name    string      `json:"name"`
-		Role    *PersonRole `json:"role,omitempty"`
-		Tags    []string    `json:"tags,omitempty"`
+		Role    *PersonRole `json:"role,omitzero"`
+		Tags    []string    `json:"tags,omitzero"`
 	}
 	var sh shadow
 	if err := json.Unmarshal(data, &sh); err != nil {
@@ -94,7 +94,7 @@ func (x *Person) Validate() error {
 // Address is generated from its JSON Schema.
 type Address struct {
 	Street string  `json:"street"`
-	Zip    *string `json:"zip,omitempty"`
+	Zip    *string `json:"zip,omitzero"`
 }
 
 // UnmarshalJSON decodes data into Address, enforcing required properties.
@@ -110,7 +110,7 @@ func (x *Address) UnmarshalJSON(data []byte) error {
 	}
 	type shadow struct {
 		Street string  `json:"street"`
-		Zip    *string `json:"zip,omitempty"`
+		Zip    *string `json:"zip,omitzero"`
 	}
 	var sh shadow
 	if err := json.Unmarshal(data, &sh); err != nil {

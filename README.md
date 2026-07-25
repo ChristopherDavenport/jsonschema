@@ -4,9 +4,10 @@
 
 If you consume or produce JSON that has a schema, `jsonschema` gives you two
 things the Go ecosystem has been missing at once: a validator that actually
-implements the **whole** spec — 100% of the official JSON Schema Test Suite for
-draft 2020-12, 2019-09, and draft-07, including `$ref`/`$dynamicRef`, `oneOf`,
-`if`/`then`/`else`, `unevaluated*`, `format`, and vocabularies — and a code
+implements the **whole** spec — 100% of the official JSON Schema Test Suite's
+**required set** for draft 2020-12, 2019-09, and draft-07, including
+`$ref`/`$dynamicRef`, `oneOf`, `if`/`then`/`else`, `unevaluated*`, and
+vocabularies ([details and the one inherent gap](CONFORMANCE.md)) — and a code
 generator that turns a schema into **idiomatic Go types** whose `UnmarshalJSON`
 and `Validate` enforce that schema for you. Point it at a schema and get structs,
 enums, discriminated-union interfaces, embedded compositions, and typed
@@ -98,8 +99,10 @@ pkg.go.dev render usefully. Wire the generator into your build with `go:generate
 ### 1. Objects and required fields
 
 The foundation: an object becomes a struct; optional fields become pointers with
-`omitempty`; required fields are enforced at decode time by a generated
+`omitzero`; required fields are enforced at decode time by a generated
 `UnmarshalJSON` (since `encoding/json` cannot otherwise tell absent from zero).
+`omitzero` (Go 1.24) omits only the zero value, so an empty-but-present array or
+map round-trips instead of being erased.
 
 ```json
 {
@@ -115,7 +118,7 @@ The foundation: an object becomes a struct; optional fields become pointers with
 
 ```go
 type User struct {
-	Active *bool  `json:"active,omitempty"`
+	Active *bool  `json:"active,omitzero"`
 	Email  string `json:"email"`
 	ID     int64  `json:"id"`
 }
@@ -131,7 +134,7 @@ func (x *User) UnmarshalJSON(data []byte) error {
 		}
 	}
 	type shadow struct {
-		Active *bool  `json:"active,omitempty"`
+		Active *bool  `json:"active,omitzero"`
 		Email  string `json:"email"`
 		ID     int64  `json:"id"`
 	}
@@ -167,10 +170,10 @@ checks that call the dependency-free `xvalid` helpers.
 
 ```go
 type Account struct {
-	Age  *int64       `json:"age,omitempty"`
+	Age  *int64       `json:"age,omitzero"`
 	ID   string       `json:"id"`
 	Name string       `json:"name"`
-	Role *AccountRole `json:"role,omitempty"`
+	Role *AccountRole `json:"role,omitzero"`
 }
 
 // (UnmarshalJSON enforces the required id and name, as in example 1.)
@@ -248,9 +251,9 @@ package-level variable.
 
 ```go
 type Resource struct {
-	Address *Address          `json:"address,omitempty"`
-	Labels  map[string]string `json:"labels,omitempty"`
-	Tags    []string          `json:"tags,omitempty"`
+	Address *Address          `json:"address,omitzero"`
+	Labels  map[string]string `json:"labels,omitzero"`
+	Tags    []string          `json:"tags,omitzero"`
 }
 
 func (x *Resource) Validate() error {
@@ -387,10 +390,10 @@ case *Bank:
 
 ### 5. `allOf` — composition as struct embedding
 
-An `allOf` whose every member is generated as a struct — an object schema with
-declared properties, directly or through a `$ref` — becomes Go struct embedding.
-Each part decodes from the full object (so it enforces its own `required`), and
-the composite `Validate` delegates to each part.
+An `allOf` whose every member is an object schema — directly or through a `$ref` —
+becomes Go struct embedding. Each part decodes from the full object (so it
+enforces its own `required`), the composite `Validate` delegates to each part,
+and a generated `MarshalJSON` merges the parts back into one flat object.
 
 ```json
 {
@@ -434,9 +437,22 @@ func (x *Record) Validate() error {
 ```
 
 `x.ID` and `x.CreatedBy` are promoted, so `Record` reads like one flat struct.
-Members that would not be structs — a free-form dictionary, a scalar, a union —
-are refused rather than embedded, since embedding those would change the JSON
-shape; that composition falls to one of the two modes below.
+
+Marshaling merges the parts rather than relying on Go's promotion rules, which
+cannot express two of the compositions the schema allows: a property declared by
+two members would be an ambiguous promoted field and get dropped from the output
+entirely, and a free-form `additionalProperties` member is a `map` that would
+nest under its own type name. Merging emits one flat object either way, with the
+earlier part winning a shared key:
+
+```
+allOf: [Base{id,name}, Audit{id,createdBy}, Extras{additionalProperties}]
+{"id":"1","name":"n","createdBy":"me","extra":"e"}   // in, and back out again
+```
+
+Members that are not object schemas — a scalar, an array, a union — have no
+properties to contribute, so those compositions fall to one of the two modes
+below.
 
 ### 6. `if`/`then`/`else` — conditional requirements
 
@@ -642,7 +658,7 @@ wrote item.gen.go
       jsonschema engine
 
   Meta (no Validate method: not a struct or enum)
-    - allOf: member 1 is an object schema with no declared properties (a dictionary)
+    - allOf: member 1 is not an object schema
       fix: validate the document with the jsonschema engine — -engine-fallback
       cannot enforce this: it rewrites Validate methods, and this type has none
 
@@ -682,32 +698,48 @@ required set at 100%, enforced as a CI gate:
 
 This includes full `$dynamicRef`/`$recursiveRef` dynamic-scope resolution,
 offline meta-schema self-validation, and vocabulary-aware keyword gating. See
-[CONFORMANCE.md](./CONFORMANCE.md) for details and the one inherent limitation
-(RE2 lacks lookaround/backreferences, shared by every Go regex validator).
+[CONFORMANCE.md](./CONFORMANCE.md) for details and the one remaining limitation:
+Go's RE2 has no lookaround or backreferences, so `pattern` needs a different
+regexp engine for those — supply one with `xvalid.UseRegexpEngine`.
 
 ## Coverage vs. omissis/go-jsonschema
 
-Legend: ✅ validated & generated · ⚙️ typed only · ❌ ignored/absent.
+The two columns below describe *generated code*. The runtime validator implements
+every keyword in this table — the distinction only matters for the generator.
+
+Legend: ✅ validated & generated · 🔶 validated by the engine; the generator
+reports it as unenforced (a `NOTE`, the report, and a `-strict` failure) ·
+⚙️ typed only · ❌ ignored/absent.
 
 | Feature | `jsonschema` (this) | omissis/go-jsonschema |
 |---|:--:|:--:|
 | `type`, `properties`, `required`, `enum` | ✅ | ✅ |
 | `const`, numeric, string constraints | ✅ | ✅ |
 | `uniqueItems`, `dependentRequired` | ✅ | ❌ |
-| `min`/`maxProperties`, `min`/`maxContains` | ✅ | ❌ |
 | `oneOf` (interface + variants) | ✅ | ❌ |
+| `anyOf` | ✅ | partial |
 | `allOf` (struct embedding) | ✅ (embedding inline; rest via fallback) | partial |
-| `anyOf` / `not` | ✅ | partial |
+| `not` | ✅ (validate; generate via fallback) | partial |
 | `if` / `then` / `else` | ✅ (discriminator inline; rest via fallback) | ❌ |
 | `dependentSchemas` | ✅ (validate; generate via fallback) | ❌ |
-| `patternProperties`, `propertyNames` | ✅ | ❌ |
+| `contains` / `min`/`maxContains` | ✅ (validate; generate via fallback) | ❌ |
+| `unevaluatedItems` | ✅ (validate; generate via fallback) | ❌ |
+| `min`/`maxProperties` | 🔶 | ❌ |
+| `patternProperties`, `propertyNames` | 🔶 | ❌ |
+| `unevaluatedProperties` | 🔶 | ❌ |
 | `prefixItems` / tuples | ✅ | ❌ |
-| `unevaluatedProperties` / `unevaluatedItems` | ✅ | ❌ |
 | Boolean subschemas (`true`/`false`) | ✅ | partial |
 | `format` assertion (uuid/email/uri/…) | ✅ (opt-in) | ❌ |
 | nested `$ref`, remote refs, recursion | ✅ | partial |
 | `$dynamicRef` / `$recursiveRef` | ✅ | ❌ |
 | meta-schema self-validation (bundled) | ✅ | ❌ |
+
+The 🔶 rows are the keywords a generated struct cannot enforce even with
+`-engine-fallback`: the engine validates the marshaled value, which carries only
+the properties the Go type declares, so a count or a name test over its key set
+would answer a different question than the schema asked. They are announced
+rather than silently dropped — see
+[docs/conditionals.md §5.3](docs/conditionals.md).
 
 ## Package layout
 

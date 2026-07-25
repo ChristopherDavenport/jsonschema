@@ -7,12 +7,12 @@ package jsonschema
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 
 	"github.com/ChristopherDavenport/jsonschema/dialect"
 	"github.com/ChristopherDavenport/jsonschema/ir"
 	"github.com/ChristopherDavenport/jsonschema/loader"
 	"github.com/ChristopherDavenport/jsonschema/metaschema"
+	"github.com/ChristopherDavenport/jsonschema/xvalid"
 )
 
 // Compiler accumulates schema resources and compiles them into validators.
@@ -124,7 +124,7 @@ func (s *Schema) Validate(instance any) error {
 	v := &validator{
 		ldr:          s.ldr,
 		assertFormat: s.assertFormat,
-		patterns:     map[string]*regexp.Regexp{},
+		patterns:     map[string]xvalid.Regexp{},
 		vocab:        s.activeVocab(),
 	}
 	if _, err := v.validate(s.root, instance, "", ""); err != nil {
