@@ -116,22 +116,34 @@ func TestConservativeShapes(t *testing.T) {
 		name    string
 		schema  string
 		absent  string // generated source must not contain this
+		note    string // the NOTE must name this exact condition
 		comment string
 	}{{
 		name:    "then requires an undeclared property",
 		schema:  `{"type":"object","properties":{"kind":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret"}}},"then":{"required":["value"]}}`,
 		absent:  `*x.Kind == "secret"`,
+		note:    `then requires "value", which is not a declared property`,
 		comment: "no field backs `value`, so the requirement is uncheckable inline",
 	}, {
 		name:    "tag property carries an extra assertion",
 		schema:  `{"type":"object","properties":{"kind":{"type":"string"},"value":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret","minLength":99}}},"then":{"required":["value"]}}`,
 		absent:  `*x.Kind == "secret"`,
+		note:    `if property "kind" is not a plain string const/enum match`,
 		comment: "minLength inside the if would be dropped by a plain tag comparison",
 	}, {
 		name:    "allOf member is a dictionary, not a struct",
 		schema:  `{"allOf":[{"$ref":"#/$defs/a"},{"$ref":"#/$defs/dict"}],"$defs":{"a":{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}},"dict":{"type":"object","additionalProperties":{"type":"string"}}}}`,
 		absent:  "\tDict\n",
+		note:    "allOf: member 2 is an object schema with no declared properties",
 		comment: "embedding a named map type would marshal as {\"Dict\":{…}}",
+	}, {
+		// The if/then here IS mirrored; only `not` is not. The NOTE must say so
+		// rather than implicating the whole family.
+		name:    "only the unenforced keyword is named",
+		schema:  `{"type":"object","properties":{"kind":{"type":"string"},"value":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret"}}},"then":{"required":["value"]},"not":{"required":["ghost"]}}`,
+		absent:  "if/then/else",
+		note:    "  - not\n",
+		comment: "the discriminator if is enforced; only `not` is not",
 	}}
 
 	for _, tc := range cases {
@@ -142,10 +154,10 @@ func TestConservativeShapes(t *testing.T) {
 			}
 			src := string(out)
 			if strings.Contains(src, tc.absent) {
-				t.Errorf("generated code took the inline path (%s):\n%s", tc.comment, src)
+				t.Errorf("generated code contains %q (%s):\n%s", tc.absent, tc.comment, src)
 			}
-			if !strings.Contains(src, "NOTE:") {
-				t.Errorf("unenforced keyword was not reported with a NOTE (%s):\n%s", tc.comment, src)
+			if !strings.Contains(src, tc.note) {
+				t.Errorf("NOTE does not name the condition %q (%s):\n%s", tc.note, tc.comment, src)
 			}
 		})
 	}

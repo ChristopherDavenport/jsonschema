@@ -94,6 +94,9 @@ func (a *analyzer) unique(want string) string {
 // build fills in a declaration's kind and body.
 func (a *analyzer) build(d *Decl) error {
 	s := d.Schema
+	if len(s.AllOf) > 0 && !a.allOfEmbeddable(s) {
+		d.AllOfBlocked = a.allOfBlocker(s)
+	}
 	switch {
 	case xgoType(s) != nil:
 		d.Kind = Alias
@@ -309,13 +312,50 @@ func (a *analyzer) allOfEmbeddable(s *ir.Schema) bool {
 // some other named type — embedding either would give the member a JSON name of
 // its own (`{"Dict": {…}}`) instead of merging its properties into the parent.
 func embeddableMember(s *ir.Schema) bool {
-	if s.IsBoolean() || xgoType(s) != nil {
-		return false
+	return memberBlocker(s) == ""
+}
+
+// memberBlocker describes why a member is not embeddable, or "" when it is.
+func memberBlocker(s *ir.Schema) string {
+	switch {
+	case s.IsBoolean():
+		return "a boolean schema"
+	case xgoType(s) != nil:
+		return "an x-go type override"
+	case len(s.Enum) > 0:
+		return "an enum"
+	case s.Const != nil:
+		return "a const"
+	case len(s.OneOf) > 0 || len(s.AnyOf) > 0:
+		return "a oneOf/anyOf union"
+	case !isObject(s):
+		return "not an object schema"
+	case len(s.Properties) == 0:
+		return "an object schema with no declared properties (a dictionary)"
 	}
-	if len(s.Enum) > 0 || s.Const != nil || len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
-		return false
+	return ""
+}
+
+// allOfBlocker explains why an allOf cannot be modeled as struct embedding,
+// naming the member responsible.
+func (a *analyzer) allOfBlocker(s *ir.Schema) string {
+	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
+		return "the schema's own oneOf/anyOf takes precedence"
 	}
-	return isObject(s) && len(s.Properties) > 0
+	for i, m := range s.AllOf {
+		target := m
+		if m.Ref != "" {
+			r, err := a.res.Resolve(m.BaseURI, m.Ref)
+			if err != nil {
+				return fmt.Sprintf("member %d: $ref %q does not resolve", i+1, m.Ref)
+			}
+			target = r
+		}
+		if why := memberBlocker(target); why != "" {
+			return fmt.Sprintf("member %d is %s", i+1, why)
+		}
+	}
+	return ""
 }
 
 // typeRef computes the Go type of a subschema, creating nested named types

@@ -37,20 +37,49 @@ func (e *emitter) hybrid(d *gotype.Decl) bool {
 // needsFallback reports whether a declaration uses keywords that are neither
 // mirrored inline nor handled idiomatically (allOf embedding, discriminator if).
 func (e *emitter) needsFallback(d *gotype.Decl) bool {
+	return len(e.unenforced(d)) > 0
+}
+
+// unenforced lists, one line each, the keywords this declaration uses that
+// generated code does not enforce, and for the shapes with several recognition
+// rules, which rule it missed. An empty result means everything is mirrored.
+func (e *emitter) unenforced(d *gotype.Decl) []string {
 	s := d.Schema
 	if s == nil {
-		return false
+		return nil
 	}
-	if s.Not != nil || len(s.DependentSchemas) > 0 {
-		return true
+	var out []string
+	if s.Not != nil {
+		out = append(out, "not")
 	}
-	if (s.If != nil || s.Then != nil || s.Else != nil) && !e.ifHandled(d) {
-		return true
+	if len(s.DependentSchemas) > 0 {
+		out = append(out, "dependentSchemas ("+quoteList(sortedStrings(keysOf(s.DependentSchemas)))+")")
+	}
+	if s.If != nil || s.Then != nil || s.Else != nil {
+		if why := e.ifBlocker(d); why != "" {
+			out = append(out, "if/then/else: "+why)
+		}
 	}
 	if len(s.AllOf) > 0 && !d.AllOfHandled {
-		return true
+		why := d.AllOfBlocked
+		if why == "" {
+			why = "members cannot be expressed as struct embedding"
+		}
+		out = append(out, "allOf: "+why)
 	}
-	return false
+	return out
+}
+
+// quoteList renders names as a comma-separated list of quoted strings.
+func quoteList(names []string) string {
+	var b bytes.Buffer
+	for i, n := range names {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%q", n)
+	}
+	return b.String()
 }
 
 type patternVar struct {
@@ -291,13 +320,18 @@ func typeDoc(name, desc string) string {
 // about unenforced keywords goes on the type itself.
 func (e *emitter) emitTypeDoc(f *jen.File, d *gotype.Decl, extra string) {
 	f.Comment(typeDoc(d.Name, d.Doc) + extra)
-	if !e.needsFallback(d) {
+	reasons := e.unenforced(d)
+	if len(reasons) == 0 {
 		return
 	}
 	f.Comment("")
-	f.Comment("NOTE: this schema uses allOf, not, dependentSchemas, or if/then/else that")
-	f.Comment("nothing generated for this type enforces, and that -engine-fallback does")
-	f.Comment("not cover for a non-struct type. Validate with the jsonschema engine.")
+	f.Comment("NOTE: nothing generated for this type enforces:")
+	for _, r := range reasons {
+		f.Comment("  - " + r)
+	}
+	f.Comment("")
+	f.Comment("-engine-fallback does not cover a non-struct type, so validate values of")
+	f.Comment("this type with the jsonschema engine.")
 }
 
 func keysOf[V any](m map[string]V) []string {
@@ -353,14 +387,16 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 	body = append(body, jen.Return(jen.Nil()))
 
 	// Warn when the schema uses keywords the generator does not enforce (and
-	// the engine fallback was not requested).
-	if e.needsFallback(d) {
+	// the engine fallback was not requested), naming each one.
+	if reasons := e.unenforced(d); len(reasons) > 0 {
 		f.Comment("Validate reports whether x satisfies the constraints this type mirrors inline.")
 		f.Comment("")
-		f.Comment("NOTE: this schema uses not, dependentSchemas, a non-embeddable allOf, or")
-		f.Comment("a non-discriminator if/then/else that generated Validate does not")
-		f.Comment("enforce. Regenerate with -engine-fallback, or validate with the")
-		f.Comment("jsonschema engine.")
+		f.Comment("NOTE: it does not enforce:")
+		for _, r := range reasons {
+			f.Comment("  - " + r)
+		}
+		f.Comment("")
+		f.Comment("Regenerate with -engine-fallback, or validate with the jsonschema engine.")
 	} else {
 		f.Comment("Validate reports whether x satisfies the schema.")
 	}
@@ -369,60 +405,65 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 
 // ifHandled reports whether a struct's if/then/else is a string-discriminator
 // with required-only then/else branches — the subset we mirror idiomatically.
+// It is defined as "ifBlocker found nothing", so the decision to mirror and the
+// explanation emitted when we don't can never disagree.
 func (e *emitter) ifHandled(d *gotype.Decl) bool {
+	return e.ifBlocker(d) == ""
+}
+
+// ifBlocker names the first recognition rule a struct's if/then/else fails, in
+// schema terms, or "" when the whole shape is mirrored inline. The rules: the
+// `if` constrains nothing but `properties`; every one of those properties is a
+// plain string const/enum match against a plain Go string field; and `then`/
+// `else` constrain nothing but a non-empty `required` over declared properties.
+func (e *emitter) ifBlocker(d *gotype.Decl) string {
 	s := d.Schema
-	if s.If == nil {
-		return false
+	switch {
+	case s.If == nil:
+		return "then/else with no if"
+	case s.If.IsBoolean():
+		return "if is a boolean schema"
+	case len(s.If.Properties) == 0:
+		return "if does not constrain any property"
+	case s.If.Ref != "" || s.If.Not != nil || s.If.If != nil ||
+		len(s.If.AllOf) > 0 || len(s.If.AnyOf) > 0 || len(s.If.OneOf) > 0 ||
+		len(s.If.Required) > 0 || !s.If.Type.Empty():
+		return "if constrains more than properties"
 	}
-	if !isStringDiscriminator(s.If) {
-		return false
-	}
-	if s.Then != nil && !isRequiredOnly(s.Then) {
-		return false
-	}
-	if s.Else != nil && !isRequiredOnly(s.Else) {
-		return false
-	}
+
 	byJSON := fieldsByJSON(d)
-	for name := range s.If.Properties {
+	for _, name := range sortedStrings(keysOf(s.If.Properties)) {
+		if !isSimpleStringMatch(s.If.Properties[name]) {
+			return fmt.Sprintf("if property %q is not a plain string const/enum match", name)
+		}
 		f, ok := byJSON[name]
-		if !ok || !isStringField(f) {
-			return false
+		if !ok {
+			return fmt.Sprintf("if property %q is not a declared property", name)
+		}
+		if !isStringField(f) {
+			return fmt.Sprintf("if property %q is not a plain Go string field", name)
 		}
 	}
-	// Every property a branch requires must exist as a field: a name with no
-	// field could not be checked at all, and pretending otherwise would emit a
-	// Validate that silently ignores the requirement.
-	for _, branch := range []*ir.Schema{s.Then, s.Else} {
-		if branch == nil {
+
+	for _, branch := range []struct {
+		kw  string
+		sch *ir.Schema
+	}{{"then", s.Then}, {"else", s.Else}} {
+		if branch.sch == nil {
 			continue
 		}
-		for _, name := range branch.Required {
+		if !isRequiredOnly(branch.sch) {
+			return branch.kw + " constrains more than a non-empty required"
+		}
+		// A required name with no field could not be checked at all, and
+		// pretending otherwise would emit a Validate that silently ignores it.
+		for _, name := range branch.sch.Required {
 			if _, ok := byJSON[name]; !ok {
-				return false
+				return fmt.Sprintf("%s requires %q, which is not a declared property", branch.kw, name)
 			}
 		}
 	}
-	return true
-}
-
-// isStringDiscriminator reports whether sch is `{properties: {P: const/enum
-// string, ...}}` and nothing else — a tag check on one or more string fields.
-func isStringDiscriminator(sch *ir.Schema) bool {
-	if sch.IsBoolean() || len(sch.Properties) == 0 {
-		return false
-	}
-	if sch.Ref != "" || sch.Not != nil || sch.If != nil ||
-		len(sch.AllOf) > 0 || len(sch.AnyOf) > 0 || len(sch.OneOf) > 0 ||
-		len(sch.Required) > 0 || !sch.Type.Empty() {
-		return false
-	}
-	for _, ps := range sch.Properties {
-		if !isSimpleStringMatch(ps) {
-			return false
-		}
-	}
-	return true
+	return ""
 }
 
 // isSimpleStringMatch reports whether ps matches a string value and nothing

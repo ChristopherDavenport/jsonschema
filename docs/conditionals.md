@@ -10,8 +10,8 @@ claims — including the traps in [§6](#6-known-gaps-and-traps) — were checke
 generating the schema, compiling the result, and running it.
 
 Related code: `gotype/analyze.go` (`allOfEmbeddable`, `embeddableMember`,
-`buildStruct`) and `gen/emit.go` (`needsFallback`, `ifHandled`,
-`isStringDiscriminator`, `isSimpleStringMatch`, `isRequiredOnly`,
+`allOfBlocker`, `buildStruct`) and `gen/emit.go` (`unenforced`, `needsFallback`,
+`ifHandled`, `ifBlocker`, `isSimpleStringMatch`, `isRequiredOnly`,
 `emitIfThenElse`, `emitDelegatingValidate`, `emitTypeDoc`).
 Pinning tests in `gen/gen_test.go`: `TestGeneratedAllOf`,
 `TestGeneratedDiscriminator`, `TestGeneratedEngineFallback` for the paths that
@@ -99,6 +99,11 @@ composition instead.
 A member whose `$ref` cannot be resolved (e.g. a remote document that was not
 supplied) makes the whole composition non-embeddable.
 
+When a member blocks embedding, `allOfBlocker` records which one and why, and the
+generated `NOTE` names it: `allOf: member 2 is an object schema with no declared
+properties (a dictionary)`, `member 1 is not an object schema`, `member 2 is a
+oneOf/anyOf union`, `member 2: $ref "…" does not resolve`, and so on.
+
 ### What is emitted
 
 ```json
@@ -178,11 +183,15 @@ carrying a `NOTE` and no `Validate` — see [§5.3](#53-what-the-fallback-does-n
 
 ### Recognition rule
 
-`gen/emit.go:ifHandled` accepts the conditional when **all** of:
+`gen/emit.go:ifBlocker` walks these rules in order and returns the first one that
+fails; `ifHandled` is "no rule failed". The failing rule is also the text that
+lands in the generated `NOTE`, shown in the right-hand column:
 
-1. `if` is an object schema whose **only** keyword is `properties`
-   (`isStringDiscriminator`). Any `required`, `type`, `$ref`, `not`, nested
-   `if`, `allOf`/`anyOf`/`oneOf` in the `if` disqualifies it.
+1. `if` is an object schema whose **only** keyword is `properties`. Any
+   `required`, `type`, `$ref`, `not`, nested `if`, or
+   `allOf`/`anyOf`/`oneOf` in the `if` disqualifies it.
+   → `if constrains more than properties` (or `if does not constrain any
+   property`, `if is a boolean schema`, `then/else with no if`)
 2. Every property inside `if.properties` matches a string value and **nothing
    else** (`isSimpleStringMatch`): a string `const` or an all-string `enum`,
    optionally restating `"type": "string"`. A non-string `const`, a mixed-type
@@ -190,13 +199,18 @@ carrying a `NOTE` and no `Validate` — see [§5.3](#53-what-the-fallback-does-n
    (`minLength`, `pattern`, `$ref`, `format`, …) disqualifies the shape. Pure
    annotations (`title`, `description`, `default`, `examples`, `$comment`,
    `deprecated`) are ignored, since they never constrain.
+   → `if property "kind" is not a plain string const/enum match`
 3. Each of those property names exists as a field on the generated struct whose
    Go type is exactly `string` — not a named type, not a slice or map.
+   → `if property "kind" is not a declared property` /
+   `… is not a plain Go string field`
 4. `then` and `else`, when present, constrain **nothing but `required`**, with a
    non-empty list (`isRequiredOnly`).
+   → `then constrains more than a non-empty required`
 5. Every property named in `then`/`else` `required` exists as a field on the
    struct. A name with no field could not be checked at all, so the whole
    conditional is refused rather than partly enforced.
+   → `then requires "value", which is not a declared property`
 
 `then`/`else` may be omitted; `else` alone is fine.
 
@@ -258,8 +272,9 @@ if x.Kind == nil || *x.Kind == "secret" {
 ### Near misses — shapes that look handled but are not
 
 Each of these falls out of the inline path and lands on the default `NOTE` (or
-the engine fallback when enabled). This is the table to check when generated
-`Validate` doesn't enforce a conditional you expected:
+the engine fallback when enabled). The `NOTE` itself names the rule that failed,
+so this table is mostly background — reach for it when you want to know *why* the
+rule exists:
 
 | Schema | Why it is rejected |
 |---|---|
@@ -310,47 +325,65 @@ the tag as a pointer, or make it `required` (where non-pointer is faithful).
 
 The type and an inline `Validate` are still generated for every keyword that
 mirrors cleanly; the unmirrored keyword is skipped and the method carries a
-comment:
+comment that names it — and, for the shapes with several recognition rules, which
+rule was missed:
 
 ```go
 // Validate reports whether x satisfies the constraints this type mirrors inline.
 //
-// NOTE: this schema uses not, dependentSchemas, a non-embeddable allOf, or
-// a non-discriminator if/then/else that generated Validate does not
-// enforce. Regenerate with -engine-fallback, or validate with the
-// jsonschema engine.
+// NOTE: it does not enforce:
+//   - if/then/else: then requires "value", which is not a declared property
+//
+// Regenerate with -engine-fallback, or validate with the jsonschema engine.
 func (x *Root) Validate() error {
 	return nil
 }
 ```
 
+The list is per keyword, so a schema using two of them says so:
+
+```go
+// NOTE: it does not enforce:
+//   - not
+//   - dependentSchemas ("kind", "size")
+```
+
 A declaration that has no mirrored `Validate` to carry the warning — an alias, an
-enum, a `oneOf`/`anyOf` interface — gets it on the type instead:
+enum, a `oneOf`/`anyOf` interface — gets it on the type instead, with the tail
+adjusted because the flag cannot help there:
 
 ```go
 // Root is generated from its JSON Schema.
 //
-// NOTE: this schema uses allOf, not, dependentSchemas, or if/then/else that
-// nothing generated for this type enforces, and that -engine-fallback does
-// not cover for a non-struct type. Validate with the jsonschema engine.
+// NOTE: nothing generated for this type enforces:
+//   - allOf: member 2 is an object schema with no declared properties (a dictionary)
+//
+// -engine-fallback does not cover a non-struct type, so validate values of
+// this type with the jsonschema engine.
 type Root any
 ```
 
-The `NOTE` means "*some* keyword on this type is unenforced", not "nothing is
-enforced". A schema with both a discriminator `if` and a `not` gets the inline
-discriminator checks **and** the `NOTE`:
+The `NOTE` lists only what is actually unenforced, never the whole family. A
+schema with both a discriminator `if` and a `not` gets the inline discriminator
+checks *and* a `NOTE` that mentions `not` alone:
 
 ```go
-// NOTE: … (as above)
+// NOTE: it does not enforce:
+//   - not
 func (x *Root) Validate() error {
 	if x.Kind == nil || *x.Kind == "secret" { // the if/then IS enforced
 		if x.Value == nil {
 			return fmt.Errorf("\"value\" is required here")
 		}
 	}
-	return nil // the `not` is NOT
+	return nil // only the `not` is missing
 }
 ```
+
+The messages come from `emitter.unenforced`, which is also what `needsFallback`
+is defined in terms of — so a keyword can never be silently skipped without
+appearing in the list, and the `if`/`then`/`else` diagnosis (`ifBlocker`) is the
+same function that decides whether to mirror it.
 
 Output in this mode depends only on the standard library and `xvalid`.
 
@@ -432,9 +465,11 @@ Two consequences:
    ```go
    // Root is generated from its JSON Schema.
    //
-   // NOTE: this schema uses allOf, not, dependentSchemas, or if/then/else that
-   // nothing generated for this type enforces, and that -engine-fallback does
-   // not cover for a non-struct type. Validate with the jsonschema engine.
+   // NOTE: nothing generated for this type enforces:
+   //   - allOf: member 1 is not an object schema
+   //
+   // -engine-fallback does not cover a non-struct type, so validate values of
+   // this type with the jsonschema engine.
    type Root any
    ```
 

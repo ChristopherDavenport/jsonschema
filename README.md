@@ -471,7 +471,8 @@ The recognized shape is deliberately narrow: the tag is matched by a plain-strin
 `const`/`enum` and nothing else, its field's Go type is `string`, and the branches
 carry only `required` naming declared properties. Anything outside that — a
 numeric tag, an `enum`-typed field, a `then` with its own constraints — is refused
-rather than half-mirrored, and falls to one of the two modes below.
+rather than half-mirrored, and falls to one of the two modes below, where the
+generated `NOTE` names the rule it missed.
 
 ## Using the generated code
 
@@ -580,9 +581,21 @@ arbitrary subschema as a boolean predicate, which amounts to re-implementing the
 validator as generated code. For those there are two modes:
 
 - **Default:** the type and a `Validate` are still generated, the keyword is not
-  enforced, and a `NOTE` comment says so — on the `Validate` method for a struct,
-  on the type declaration for an alias, enum, or union interface. Output depends
-  only on the standard library and `xvalid`.
+  enforced, and a `NOTE` comment names exactly what was skipped — on the
+  `Validate` method for a struct, on the type declaration for an alias, enum, or
+  union interface. Output depends only on the standard library and `xvalid`.
+
+  ```go
+  // Validate reports whether x satisfies the constraints this type mirrors inline.
+  //
+  // NOTE: it does not enforce:
+  //   - if/then/else: then requires "value", which is not a declared property
+  //
+  // Regenerate with -engine-fallback, or validate with the jsonschema engine.
+  ```
+
+  It lists only what is actually unenforced: a schema whose discriminator `if` is
+  mirrored but that also uses `not` gets a `NOTE` naming `not` alone.
 - **`-engine-fallback`:** `Validate` for such a type delegates to the embedded
   schema evaluated by the runtime engine — full conformance, at the cost of a
   dependency on the `jsonschema` package and a marshal round-trip.
