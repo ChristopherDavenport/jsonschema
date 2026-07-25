@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -105,6 +106,49 @@ func TestGeneratedEngineFallback(t *testing.T) {
 // part's required fields and Validate enforced.
 func TestGeneratedAllOf(t *testing.T) {
 	runInModule(t, allOfSchema, Config{Package: "gentest", RootName: "Record"}, allOfTest)
+}
+
+// TestConservativeShapes pins the shapes that look like an inline path but are
+// deliberately refused, so they surface as a NOTE instead of a Validate that
+// quietly ignores part of the schema.
+func TestConservativeShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		absent  string // generated source must not contain this
+		comment string
+	}{{
+		name:    "then requires an undeclared property",
+		schema:  `{"type":"object","properties":{"kind":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret"}}},"then":{"required":["value"]}}`,
+		absent:  `*x.Kind == "secret"`,
+		comment: "no field backs `value`, so the requirement is uncheckable inline",
+	}, {
+		name:    "tag property carries an extra assertion",
+		schema:  `{"type":"object","properties":{"kind":{"type":"string"},"value":{"type":"string"}},"if":{"properties":{"kind":{"const":"secret","minLength":99}}},"then":{"required":["value"]}}`,
+		absent:  `*x.Kind == "secret"`,
+		comment: "minLength inside the if would be dropped by a plain tag comparison",
+	}, {
+		name:    "allOf member is a dictionary, not a struct",
+		schema:  `{"allOf":[{"$ref":"#/$defs/a"},{"$ref":"#/$defs/dict"}],"$defs":{"a":{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}},"dict":{"type":"object","additionalProperties":{"type":"string"}}}}`,
+		absent:  "\tDict\n",
+		comment: "embedding a named map type would marshal as {\"Dict\":{…}}",
+	}}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := Generate(Config{Package: "p", RootName: "Root"}, []byte(tc.schema))
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			src := string(out)
+			if strings.Contains(src, tc.absent) {
+				t.Errorf("generated code took the inline path (%s):\n%s", tc.comment, src)
+			}
+			if !strings.Contains(src, "NOTE:") {
+				t.Errorf("unenforced keyword was not reported with a NOTE (%s):\n%s", tc.comment, src)
+			}
+		})
+	}
 }
 
 // runInModule generates code, drops it into a temp module, and runs its tests.

@@ -285,6 +285,21 @@ func typeDoc(name, desc string) string {
 	return name + " is generated from its JSON Schema."
 }
 
+// emitTypeDoc writes a declaration's godoc comment. For a type that is not a
+// struct — an alias, enum or union interface — there is no mirrored Validate to
+// carry the NOTE, and the engine fallback cannot delegate either, so the warning
+// about unenforced keywords goes on the type itself.
+func (e *emitter) emitTypeDoc(f *jen.File, d *gotype.Decl, extra string) {
+	f.Comment(typeDoc(d.Name, d.Doc) + extra)
+	if !e.needsFallback(d) {
+		return
+	}
+	f.Comment("")
+	f.Comment("NOTE: this schema uses allOf, not, dependentSchemas, or if/then/else that")
+	f.Comment("nothing generated for this type enforces, and that -engine-fallback does")
+	f.Comment("not cover for a non-struct type. Validate with the jsonschema engine.")
+}
+
 func keysOf[V any](m map[string]V) []string {
 	ks := make([]string, 0, len(m))
 	for k := range m {
@@ -342,9 +357,10 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 	if e.needsFallback(d) {
 		f.Comment("Validate reports whether x satisfies the constraints this type mirrors inline.")
 		f.Comment("")
-		f.Comment("NOTE: this schema uses not, dependentSchemas, or a non-discriminator")
-		f.Comment("if/then/else that generated Validate does not enforce. Regenerate")
-		f.Comment("with -engine-fallback, or validate with the jsonschema engine.")
+		f.Comment("NOTE: this schema uses not, dependentSchemas, a non-embeddable allOf, or")
+		f.Comment("a non-discriminator if/then/else that generated Validate does not")
+		f.Comment("enforce. Regenerate with -engine-fallback, or validate with the")
+		f.Comment("jsonschema engine.")
 	} else {
 		f.Comment("Validate reports whether x satisfies the schema.")
 	}
@@ -374,6 +390,19 @@ func (e *emitter) ifHandled(d *gotype.Decl) bool {
 			return false
 		}
 	}
+	// Every property a branch requires must exist as a field: a name with no
+	// field could not be checked at all, and pretending otherwise would emit a
+	// Validate that silently ignores the requirement.
+	for _, branch := range []*ir.Schema{s.Then, s.Else} {
+		if branch == nil {
+			continue
+		}
+		for _, name := range branch.Required {
+			if _, ok := byJSON[name]; !ok {
+				return false
+			}
+		}
+	}
 	return true
 }
 
@@ -389,9 +418,53 @@ func isStringDiscriminator(sch *ir.Schema) bool {
 		return false
 	}
 	for _, ps := range sch.Properties {
-		if stringDiscriminatorValues(ps) == nil {
+		if !isSimpleStringMatch(ps) {
 			return false
 		}
+	}
+	return true
+}
+
+// isSimpleStringMatch reports whether ps matches a string value and nothing
+// else: a string `const` or an all-string `enum`, optionally restating `"type":
+// "string"`. Any further assertion on the tag would have to be mirrored too, so
+// it disqualifies the discriminator shape rather than being dropped.
+func isSimpleStringMatch(ps *ir.Schema) bool {
+	if ps.IsBoolean() || stringDiscriminatorValues(ps) == nil {
+		return false
+	}
+	if ps.Const != nil && len(ps.Enum) > 0 {
+		return false // both apply; only const would be mirrored
+	}
+	// `type` may only restate that the value is a string.
+	if !ps.Type.Empty() && (len(ps.Type) != 1 || !ps.Type.Contains(ir.TypeString)) {
+		return false
+	}
+	return !hasOtherAssertions(ps)
+}
+
+// hasOtherAssertions reports whether s carries any assertion or applicator
+// beyond `type`, `const` and `enum`. Pure annotations (title, description,
+// default, examples, deprecated, $comment) are ignored: they never constrain.
+func hasOtherAssertions(s *ir.Schema) bool {
+	switch {
+	case s.Ref != "" || s.DynamicRef != "":
+	case len(s.AllOf) > 0 || len(s.AnyOf) > 0 || len(s.OneOf) > 0 || s.Not != nil:
+	case s.If != nil || s.Then != nil || s.Else != nil || len(s.DependentSchemas) > 0:
+	case len(s.Properties) > 0 || len(s.PatternProperties) > 0 ||
+		s.AdditionalProperties != nil || s.PropertyNames != nil || s.UnevaluatedProperties != nil:
+	case len(s.PrefixItems) > 0 || s.Items != nil || s.Contains != nil || s.UnevaluatedItems != nil:
+	case s.MultipleOf != nil || s.Maximum != nil || s.ExclusiveMaximum != nil ||
+		s.Minimum != nil || s.ExclusiveMinimum != nil:
+	case s.MaxLength != nil || s.MinLength != nil || s.Pattern != "":
+	case s.MaxItems != nil || s.MinItems != nil || s.UniqueItems ||
+		s.MaxContains != nil || s.MinContains != nil:
+	case s.MaxProperties != nil || s.MinProperties != nil ||
+		len(s.Required) > 0 || len(s.DependentRequired) > 0:
+	case s.Format != "":
+	case s.ContentEncoding != "" || s.ContentMediaType != "" || s.ContentSchema != nil:
+	default:
+		return false
 	}
 	return true
 }
@@ -731,7 +804,7 @@ func fieldNumKind(fld *gotype.Field) string {
 }
 
 func (e *emitter) emitEnum(f *jen.File, d *gotype.Decl) {
-	f.Comment(typeDoc(d.Name, d.Doc))
+	e.emitTypeDoc(f, d, "")
 	f.Type().Id(d.Name).Add(e.typeCode(d.Underlying))
 	defs := make([]jen.Code, 0, len(d.Enum))
 	cases := make([]jen.Code, 0, len(d.Enum))
@@ -751,7 +824,7 @@ func (e *emitter) emitEnum(f *jen.File, d *gotype.Decl) {
 }
 
 func (e *emitter) emitAlias(f *jen.File, d *gotype.Decl) {
-	f.Comment(typeDoc(d.Name, d.Doc))
+	e.emitTypeDoc(f, d, "")
 	f.Type().Id(d.Name).Add(e.typeCode(d.Underlying))
 }
 
@@ -759,7 +832,7 @@ func (e *emitter) emitAlias(f *jen.File, d *gotype.Decl) {
 // method on each variant, and an Unmarshal<Name> dispatcher.
 func (e *emitter) emitInterface(f *jen.File, d *gotype.Decl) {
 	marker := "is" + d.Name
-	f.Comment(typeDoc(d.Name, d.Doc) + " It is a closed union implemented by its variant types.")
+	e.emitTypeDoc(f, d, " It is a closed union implemented by its variant types.")
 	f.Type().Id(d.Name).Interface(jen.Id(marker).Params())
 
 	for _, v := range d.Variants {

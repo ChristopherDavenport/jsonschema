@@ -280,8 +280,9 @@ func (a *analyzer) buildStruct(d *Decl) error {
 	return nil
 }
 
-// allOfEmbeddable reports whether every allOf member is an object schema (or a
-// $ref to one), so the composition can be expressed as Go struct embedding.
+// allOfEmbeddable reports whether every allOf member will be generated as a Go
+// struct (directly or through a $ref), so the composition can be expressed as
+// Go struct embedding.
 func (a *analyzer) allOfEmbeddable(s *ir.Schema) bool {
 	if len(s.AllOf) == 0 || len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
 		return false
@@ -295,11 +296,26 @@ func (a *analyzer) allOfEmbeddable(s *ir.Schema) bool {
 			}
 			target = r
 		}
-		if !isObject(target) {
+		if !embeddableMember(target) {
 			return false
 		}
 	}
 	return true
+}
+
+// embeddableMember reports whether an allOf member becomes a struct type. Only
+// a struct promotes its fields when embedded: an object schema with no declared
+// properties becomes a map alias, and an enum/const/union/x-go member becomes
+// some other named type — embedding either would give the member a JSON name of
+// its own (`{"Dict": {…}}`) instead of merging its properties into the parent.
+func embeddableMember(s *ir.Schema) bool {
+	if s.IsBoolean() || xgoType(s) != nil {
+		return false
+	}
+	if len(s.Enum) > 0 || s.Const != nil || len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
+		return false
+	}
+	return isObject(s) && len(s.Properties) > 0
 }
 
 // typeRef computes the Go type of a subschema, creating nested named types

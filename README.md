@@ -387,9 +387,10 @@ case *Bank:
 
 ### 5. `allOf` — composition as struct embedding
 
-`allOf` of object schemas becomes Go struct embedding. Each part decodes from the
-full object (so it enforces its own `required`), and the composite `Validate`
-delegates to each part.
+An `allOf` whose every member is generated as a struct — an object schema with
+declared properties, directly or through a `$ref` — becomes Go struct embedding.
+Each part decodes from the full object (so it enforces its own `required`), and
+the composite `Validate` delegates to each part.
 
 ```json
 {
@@ -425,11 +426,17 @@ func (x *Record) Validate() error {
 	if err := x.Base.Validate(); err != nil {
 		return err
 	}
-	return x.Audit.Validate()
+	if err := x.Audit.Validate(); err != nil {
+		return err
+	}
+	return nil
 }
 ```
 
 `x.ID` and `x.CreatedBy` are promoted, so `Record` reads like one flat struct.
+Members that would not be structs — a free-form dictionary, a scalar, a union —
+are refused rather than embedded, since embedding those would change the JSON
+shape; that composition falls to one of the two modes below.
 
 ### 6. `if`/`then`/`else` — conditional requirements
 
@@ -459,6 +466,12 @@ func (x *Item) Validate() error {
 	return nil
 }
 ```
+
+The recognized shape is deliberately narrow: the tag is matched by a plain-string
+`const`/`enum` and nothing else, its field's Go type is `string`, and the branches
+carry only `required` naming declared properties. Anything outside that — a
+numeric tag, an `enum`-typed field, a `then` with its own constraints — is refused
+rather than half-mirrored, and falls to one of the two modes below.
 
 ## Using the generated code
 
@@ -567,15 +580,23 @@ arbitrary subschema as a boolean predicate, which amounts to re-implementing the
 validator as generated code. For those there are two modes:
 
 - **Default:** the type and a `Validate` are still generated, the keyword is not
-  enforced, and a `NOTE` comment says so. Output depends only on the standard
-  library and `xvalid`.
+  enforced, and a `NOTE` comment says so — on the `Validate` method for a struct,
+  on the type declaration for an alias, enum, or union interface. Output depends
+  only on the standard library and `xvalid`.
 - **`-engine-fallback`:** `Validate` for such a type delegates to the embedded
   schema evaluated by the runtime engine — full conformance, at the cost of a
   dependency on the `jsonschema` package and a marshal round-trip.
 
-The full rationale and tradeoff analysis is in
-[docs/conditionals.md](./docs/conditionals.md). Either way, the runtime engine is
-always available for complete coverage.
+The generator never half-mirrors a keyword: a schema that falls outside a
+recognized shape gets the `NOTE`, not a `Validate` that quietly skips part of it.
+Two limits are worth knowing before you rely on this: the fallback only rewrites
+`Validate` on **struct** types, and it validates the marshaled Go value rather
+than the original document. If you use either mode — or if a conditional you
+expected to be enforced isn't — read
+[docs/conditionals.md](./docs/conditionals.md): it gives the exact shapes each
+inline path recognizes, the near misses, the two remaining gaps, and recipes for
+working around them. Either way, the runtime engine is always available for
+complete coverage.
 
 The CLI takes these values as flags or from a YAML config (`-config gen.yaml`,
 with flags overriding it):
@@ -616,7 +637,7 @@ Legend: ✅ validated & generated · ⚙️ typed only · ❌ ignored/absent.
 | `uniqueItems`, `dependentRequired` | ✅ | ❌ |
 | `min`/`maxProperties`, `min`/`maxContains` | ✅ | ❌ |
 | `oneOf` (interface + variants) | ✅ | ❌ |
-| `allOf` (struct embedding) | ✅ | partial |
+| `allOf` (struct embedding) | ✅ (embedding inline; rest via fallback) | partial |
 | `anyOf` / `not` | ✅ | partial |
 | `if` / `then` / `else` | ✅ (discriminator inline; rest via fallback) | ❌ |
 | `dependentSchemas` | ✅ (validate; generate via fallback) | ❌ |
