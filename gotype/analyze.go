@@ -457,8 +457,15 @@ func (a *analyzer) refType(base, ref, hint string) *TypeRef {
 	}
 	// A plain scalar target (a string/number/integer/boolean with no enum and no
 	// structural content) is inlined as its Go scalar rather than named, so only
-	// objects and enums become distinct types.
+	// objects and enums become distinct types. But if the target is already a
+	// declared type (e.g. every $defs entry the default Analyze path declares up
+	// front), reference it by name so the declaration is not left orphaned; only
+	// a plain scalar that is not independently declared — the driver path, where
+	// IsPlainScalar lets a driver skip declaring it — is inlined.
 	if isPlainScalar(target) {
+		if name, ok := a.nameByLoc[target.Location]; ok {
+			return &TypeRef{Named: name}
+		}
 		return scalarType(target)
 	}
 	if a.cfg.ExternalRef != nil {
@@ -489,11 +496,11 @@ func (a *analyzer) mapType(s *ir.Schema, hint string) *TypeRef {
 	case s.AdditionalProperties != nil && !s.AdditionalProperties.AlwaysValid():
 		elem = a.typeRef(s.AdditionalProperties, hint+"Value")
 	case len(s.PatternProperties) > 0:
-		for _, k := range sortedKeys(s.PatternProperties) {
-			if ps := s.PatternProperties[k]; ps != nil && !ps.AlwaysValid() {
-				elem = a.typeRef(ps, hint+"Value")
-			}
-			break // one value type; patterns share it
+		// patternProperties share one Go value type; use the deterministically
+		// first pattern's value schema.
+		k := sortedKeys(s.PatternProperties)[0]
+		if ps := s.PatternProperties[k]; ps != nil && !ps.AlwaysValid() {
+			elem = a.typeRef(ps, hint+"Value")
 		}
 	}
 	return &TypeRef{Map: elem}
@@ -571,7 +578,9 @@ func IsPlainScalar(s *ir.Schema) bool { return isPlainScalar(s) }
 // isPlainScalar reports whether s is a bare scalar schema — a string, number,
 // integer or boolean (optionally nullable) with no enum, const, $ref, or
 // object/array structure — so a $ref to it inlines as the Go scalar rather than
-// generating a named type.
+// generating a named type. Value constraints (pattern, minimum, maxLength, …) do
+// not disqualify it: inlining a plain scalar discards them, which matches that a
+// named scalar alias carries no Validate method of its own to enforce them.
 func isPlainScalar(s *ir.Schema) bool {
 	if s == nil || s.IsBoolean() {
 		return false

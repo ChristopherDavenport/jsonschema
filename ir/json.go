@@ -399,7 +399,11 @@ func objectKeyOrder(data []byte) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		order = append(order, key.(string))
+		name, ok := key.(string)
+		if !ok {
+			return nil, fmt.Errorf("expected string key, got %v", key)
+		}
+		order = append(order, name)
 		// Skip the value (which may be a nested object/array) in full.
 		if err := skipValue(dec); err != nil {
 			return nil, err
