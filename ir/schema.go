@@ -9,7 +9,10 @@
 // invalid).
 package ir
 
-import "math/big"
+import (
+	"encoding/json"
+	"math/big"
+)
 
 // Schema is a single JSON Schema node.
 //
@@ -53,7 +56,13 @@ type Schema struct {
 	DependentSchemas map[string]*Schema
 
 	// Object child applicators.
-	Properties            map[string]*Schema
+	Properties map[string]*Schema
+	// PropertyOrder is the order in which keys appeared in the source `properties`
+	// object. encoding/json loses object key order when decoding into a map, so it
+	// is captured separately at parse time; consumers that want source-faithful
+	// field ordering (e.g. code generation) use it. It is empty when `properties`
+	// was absent, and its keys always match Properties.
+	PropertyOrder         []string
 	PatternProperties     map[string]*Schema
 	AdditionalProperties  *Schema
 	PropertyNames         *Schema
@@ -110,6 +119,13 @@ type Schema struct {
 
 	// XGo carries the `x-go` vendor extension used to steer code generation.
 	XGo *XGo
+
+	// Extra holds any object keys that are not recognized JSON Schema keywords
+	// (nor `x-go`): custom vendor annotations. Values are the raw JSON. It lets a
+	// code-generation driver read schema-specific extensions (e.g. a "sensitive"
+	// flag) without a bespoke parse. Empty when the schema used only standard
+	// keywords.
+	Extra map[string]json.RawMessage
 
 	// Location is set by the loader: the canonical absolute URI (base + JSON
 	// pointer/anchor) at which this schema resource resides. It is the identity

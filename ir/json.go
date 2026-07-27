@@ -120,6 +120,31 @@ type rawSchema struct {
 	XGo *XGo `json:"x-go"`
 }
 
+// knownKeywords is the set of object keys the ir model recognizes (all standard
+// JSON Schema keywords across the supported drafts, plus the `x-go` extension).
+// Any other key is captured into Schema.Extra.
+var knownKeywords = map[string]bool{
+	"$id": true, "$schema": true, "$vocabulary": true, "$anchor": true,
+	"$dynamicAnchor": true, "$ref": true, "$dynamicRef": true,
+	"$recursiveAnchor": true, "$recursiveRef": true, "$defs": true,
+	"definitions": true, "$comment": true, "title": true, "description": true,
+	"deprecated": true, "readOnly": true, "writeOnly": true, "examples": true,
+	"allOf": true, "anyOf": true, "oneOf": true, "not": true, "if": true,
+	"then": true, "else": true, "dependentSchemas": true, "properties": true,
+	"patternProperties": true, "additionalProperties": true,
+	"propertyNames": true, "unevaluatedProperties": true, "prefixItems": true,
+	"items": true, "additionalItems": true, "contains": true,
+	"unevaluatedItems": true, "type": true, "multipleOf": true, "maximum": true,
+	"exclusiveMaximum": true, "minimum": true, "exclusiveMinimum": true,
+	"maxLength": true, "minLength": true, "pattern": true, "maxItems": true,
+	"minItems": true, "uniqueItems": true, "maxContains": true,
+	"minContains": true, "maxProperties": true, "minProperties": true,
+	"required": true, "dependentRequired": true, "format": true,
+	"contentEncoding": true, "contentMediaType": true, "contentSchema": true,
+	"dependencies": true, "const": true, "default": true, "enum": true,
+	"x-go": true,
+}
+
 // UnmarshalJSON decodes a schema, which may be a boolean or an object.
 func (s *Schema) UnmarshalJSON(data []byte) error {
 	trimmed := bytes.TrimSpace(data)
@@ -147,6 +172,25 @@ func (s *Schema) UnmarshalJSON(data []byte) error {
 	*s = Schema{hasKeywords: len(keys) > 0}
 	if err := s.fromRaw(&raw); err != nil {
 		return err
+	}
+
+	// Capture source key order of `properties`, which the map above loses.
+	if msg, ok := keys["properties"]; ok {
+		order, err := objectKeyOrder(msg)
+		if err != nil {
+			return fmt.Errorf("ir: properties: %w", err)
+		}
+		s.PropertyOrder = order
+	}
+
+	// Capture unrecognized keys (custom vendor annotations) into Extra.
+	for k, v := range keys {
+		if !knownKeywords[k] {
+			if s.Extra == nil {
+				s.Extra = map[string]json.RawMessage{}
+			}
+			s.Extra[k] = v
+		}
 	}
 
 	// const/default/enum are handled from the raw key set so that a present
@@ -334,6 +378,57 @@ func (s *Schema) normalizeDependencies(raw *rawSchema) error {
 			s.DependentSchemas = map[string]*Schema{}
 		}
 		s.DependentSchemas[name] = &sub
+	}
+	return nil
+}
+
+// objectKeyOrder returns the keys of a JSON object in source order. It streams
+// tokens so the order is preserved (decoding into a map would lose it).
+func objectKeyOrder(data []byte) ([]string, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, fmt.Errorf("expected object, got %v", tok)
+	}
+	var order []string
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		order = append(order, key.(string))
+		// Skip the value (which may be a nested object/array) in full.
+		if err := skipValue(dec); err != nil {
+			return nil, err
+		}
+	}
+	return order, nil
+}
+
+// skipValue consumes one complete JSON value from dec, descending into nested
+// objects and arrays so the next token is the following key.
+func skipValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); ok && (d == '{' || d == '[') {
+		for dec.More() {
+			if d == '{' {
+				if _, err := dec.Token(); err != nil { // key
+					return err
+				}
+			}
+			if err := skipValue(dec); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil { // closing delim
+			return err
+		}
 	}
 	return nil
 }
