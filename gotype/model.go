@@ -73,8 +73,14 @@ type TypeRef struct {
 	Named string
 	// Prim is a builtin or qualified primitive ("string", "int64", "time.Time").
 	Prim string
-	// Import is the package path required by a qualified Prim (e.g. "time").
+	// Import is the package path required by a qualified Prim (e.g. "time") or,
+	// when Package is set, by a cross-package Named type.
 	Import string
+	// Package qualifies a cross-package Named reference: it is the selector to
+	// print before the name (e.g. "xfstypes"), and Import is that package's
+	// import path. Empty for a Named type generated in the same package. Set by
+	// the Config.ExternalRef hook.
+	Package string
 	// Slice / Map describe composite types; Map is always keyed by string.
 	Slice *TypeRef
 	Map   *TypeRef
