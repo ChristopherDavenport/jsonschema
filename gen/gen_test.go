@@ -1,13 +1,77 @@
 package gen
 
 import (
+	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ChristopherDavenport/jsonschema/gotype"
+	"github.com/ChristopherDavenport/jsonschema/ir"
 )
+
+// resolverFunc adapts a function to gotype.Resolver.
+type resolverFunc func(base, ref string) (*ir.Schema, error)
+
+func (f resolverFunc) Resolve(base, ref string) (*ir.Schema, error) { return f(base, ref) }
+
+// TestValidateRecursesIntoCrossPackageFields proves that a field whose type is
+// routed to another package by Config.ExternalRef is still validated: the
+// generated Validate calls it through an interface assertion (the external type
+// may or may not have a Validate method), rather than skipping it as it did when
+// nested validation was gated on the local hasValidate set only.
+func TestValidateRecursesIntoCrossPackageFields(t *testing.T) {
+	mustSchema := func(s string) *ir.Schema {
+		var sc ir.Schema
+		if err := json.Unmarshal([]byte(s), &sc); err != nil {
+			t.Fatalf("parse %s: %v", s, err)
+		}
+		return &sc
+	}
+	shared := mustSchema(`{"type":"object","required":["x"],"properties":{"x":{"type":"string","minLength":1}}}`)
+	root := mustSchema(`{"type":"object","properties":{"child":{"$ref":"shared"}}}`)
+
+	res := resolverFunc(func(_, ref string) (*ir.Schema, error) {
+		if ref == "shared" {
+			return shared, nil
+		}
+		return nil, fmt.Errorf("unknown ref %q", ref)
+	})
+	ext := func(_ string, target *ir.Schema) (pkg, name, imp string, ok bool) {
+		if target == shared {
+			return "other", "Shared", "example.com/other", true
+		}
+		return "", "", "", false
+	}
+
+	model, err := gotype.AnalyzeRoots(
+		[]gotype.NamedRoot{{Name: "Root", Schema: root}},
+		res, gotype.Config{Package: "main", ExternalRef: ext},
+	)
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+	src, _, err := EmitModel(Config{Package: "main"}, model, nil)
+	if err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	got := string(src)
+
+	if !strings.Contains(got, "other.Shared") {
+		t.Fatalf("cross-package field not qualified with its import:\n%s", got)
+	}
+	if strings.Contains(got, "type Shared ") {
+		t.Fatalf("external type should not be declared locally:\n%s", got)
+	}
+	// The Root.Validate must reach into the cross-package field.
+	if !strings.Contains(got, "any(x.Child).(interface {") || !strings.Contains(got, "Validate() error") {
+		t.Fatalf("Validate does not recurse into the cross-package field:\n%s", got)
+	}
+}
 
 var update = flag.Bool("update", false, "update golden files")
 

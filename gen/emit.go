@@ -896,10 +896,14 @@ func (e *emitter) emitStructValidate(f *jen.File, d *gotype.Decl) {
 		return
 	}
 	var body []jen.Code
-	// allOf: validate each embedded part.
+	// allOf: validate each embedded part (a cross-package part through an
+	// interface assertion, since it may be a dictionary map with no Validate).
 	for _, emb := range d.Embeds {
-		if e.hasValidate[emb.Named] {
+		switch {
+		case e.hasValidate[emb.Named]:
 			body = append(body, jen.If(jen.Err().Op(":=").Id("x").Dot(emb.Named).Dot("Validate").Call(), jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())))
+		case emb.Import != "":
+			body = append(body, e.validateIfImplements(jen.Op("&").Id("x").Dot(emb.Named)))
 		}
 	}
 	for _, fld := range d.Fields {
@@ -1435,16 +1439,51 @@ func (e *emitter) fieldChecks(fld *gotype.Field) []jen.Code {
 		))
 	}
 
-	// Nested validation for named element/field types.
-	if fld.Type.Named != "" && e.hasValidate[fld.Type.Named] {
+	// Nested validation for named element/field types. A type generated in this
+	// package is called directly; a cross-package type (Import set) is validated
+	// through an interface assertion, because whether it has a Validate method (an
+	// object/enum does; a slice/map alias does not) is not knowable here.
+	switch {
+	case fld.Type.Named != "" && e.hasValidate[fld.Type.Named]:
 		out = append(out, jen.If(jen.Err().Op(":=").Add(accessorForValidate(fld)).Dot("Validate").Call(), jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())))
-	} else if fld.Type.Slice != nil && fld.Type.Slice.Named != "" && e.hasValidate[fld.Type.Slice.Named] {
+	case fld.Type.Named != "" && fld.Type.Import != "":
+		out = append(out, e.validateIfImplements(fieldReceiver(fld)))
+	case fld.Type.Slice != nil && fld.Type.Slice.Named != "" && e.hasValidate[fld.Type.Slice.Named]:
 		out = append(out, jen.For(jen.List(jen.Id("_"), jen.Id("it")).Op(":=").Range().Add(val())).Block(
 			jen.If(jen.Err().Op(":=").Id("it").Dot("Validate").Call(), jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())),
+		))
+	case fld.Type.Slice != nil && fld.Type.Slice.Named != "" && fld.Type.Slice.Import != "":
+		out = append(out, jen.For(jen.List(jen.Id("_"), jen.Id("it")).Op(":=").Range().Add(val())).Block(
+			e.validateIfImplements(jen.Op("&").Id("it")),
 		))
 	}
 
 	return out
+}
+
+// fieldReceiver yields a *T receiver for a nested Validate call: the pointer
+// itself for an optional field, or the address of the value otherwise (so both
+// pointer- and value-receiver Validate methods are reachable).
+func fieldReceiver(fld *gotype.Field) *jen.Statement {
+	if fld.Type.Pointer {
+		return accessorForValidate(fld)
+	}
+	return jen.Op("&").Add(accessorForValidate(fld))
+}
+
+// validateIfImplements emits
+//
+//	if v, ok := any(recv).(interface{ Validate() error }); ok { if err := v.Validate(); err != nil { return err } }
+//
+// so a (possibly cross-package) type is validated only when it actually has a
+// Validate method.
+func (e *emitter) validateIfImplements(recv *jen.Statement) jen.Code {
+	return jen.If(
+		jen.List(jen.Id("v"), jen.Id("ok")).Op(":=").Id("any").Call(recv).Assert(jen.Interface(jen.Id("Validate").Params().Error())),
+		jen.Id("ok"),
+	).Block(
+		jen.If(jen.Err().Op(":=").Id("v").Dot("Validate").Call(), jen.Err().Op("!=").Nil()).Block(jen.Return(jen.Err())),
+	)
 }
 
 // numericChecks emits numeric bound and multipleOf checks. goNum is the field's
